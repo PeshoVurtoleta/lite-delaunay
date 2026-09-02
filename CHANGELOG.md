@@ -3,6 +3,49 @@
 All notable changes to `@zakkster/lite-delaunay` are documented here. The format
 is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [1.2.0] - 2026-09-03
+
+### Added
+
+- `createCellIndex(maxPoints)` -- a pooled cell-index factory (0 B/query; ~48 B
+  facade per build) that satisfies the `CellIndexFactory` contract
+  `@zakkster/lite-charts` injects to draw a Voronoi tessellation over a projected
+  scatter (see LiteCharts/briefs/voronoi-cells.md). The returned function
+  `(pxs, pys, n) -> CellIndex` builds the Delaunay mesh and precomputes every
+  triangle circumcenter once at build time; the handle exposes
+  `cell(i, bx0, by0, bx1, by1, outXY) -> vertexCount` and `dispose()`.
+  - `cell(i)` writes site `i`'s Voronoi polygon, CLIPPED to the caller's
+    axis-aligned bbox (zero-allocation Sutherland-Hodgman on fixed scratch),
+    into the caller-owned interleaved `outXY` and returns the vertex count. `i`
+    is the ORIGINAL point index. Every returned polygon is finite, convex,
+    closed (last vertex implicitly connects to the first) and fully inside-or-on
+    the bbox. Zero allocation per call.
+  - Hull cells (unbounded in the true diagram) are CLOSED by three synthetic far
+    points, anchored at the boundary circumcenters and split by the angle
+    bisector, that provably fall outside the bbox -- so the clip yields
+    cell-intersect-bbox exactly and adjacent cells tile the bbox with no seams
+    (far-fan clip exactness). Hull cells are clipped, never flagged.
+  - Fail closed everywhere: a non-finite input point, a degenerate build (fewer
+    than 3 finite points, or all-collinear / all-coincident), an EPSILON-dedup
+    duplicate that owns no mesh vertex, or a cell that misses the bbox all return
+    `0` (never a garbage polygon). Near-degenerate circumcenters fall back to the
+    triangle centroid -- no `Infinity`/`NaN` vertex is ever stored. Out-of-range
+    `i`, a non-finite / non-strictly-ordered bbox, an `outXY` too small for the
+    clipped cell, and disposed / stale handle use all THROW (never truncate).
+  - Pooling, facade and generation semantics are identical to
+    `createSpatialIndex`: one factory serves many concurrent live handles,
+    builds acquire a pooled slot and disposes return it, a new slot is allocated
+    only at a new concurrent high-water mark, `cell()` is 0 B/query, and a stale
+    or double-disposed handle throws.
+  - SIZING RULE (documented): a bbox-clipped Voronoi cell of an interior site has
+    at most `degree + 4` vertices, of a hull site at most `degree + 5`; a
+    caller-owned buffer of `2 * 64` floats covers every non-adversarial cloud,
+    and overflow throws rather than truncates.
+- `test/torture.mjs` gains a cell-index rebuild storm (build/dispose cycles
+  interleaved with `cell()` queries; `tracker.size()` back to 0) and a
+  steady-state phase (~200k `cell()` queries, 0 major GC), folded into the single
+  GATE line. The existing spatial-index budgets are unchanged.
+
 ## [1.1.1] - 2026-09-02
 
 ### Fixed

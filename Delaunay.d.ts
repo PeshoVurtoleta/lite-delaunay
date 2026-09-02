@@ -217,3 +217,93 @@ export type SpatialIndexFactory = (
  * @throws if `maxPoints` is not a non-negative integer.
  */
 export function createSpatialIndex(maxPoints: number): SpatialIndexFactory;
+
+/**
+ * A pre-built, allocation-free bbox-clipped Voronoi-cell query over a fixed set
+ * of SoA pixel coordinates. Produced by a {@link CellIndexFactory}. This is the
+ * interface `@zakkster/lite-charts` injects to draw a Voronoi tessellation over
+ * a projected scatter (see the v1.2.0 cells layer). Unlike {@link SpatialIndex}
+ * (a uniform grid), this builds the Delaunay mesh and precomputes every triangle
+ * circumcenter at build time.
+ */
+export interface CellIndex {
+    /**
+     * Write site `i`'s Voronoi polygon, CLIPPED to the axis-aligned bbox, into
+     * the caller-owned interleaved `outXY` (`[x0, y0, x1, y1, ...]`), and return
+     * the vertex count written. `i` is the ORIGINAL point index (as passed to
+     * the factory). Every returned polygon is finite, convex, and closed (the
+     * last vertex implicitly connects to the first) and lies fully inside-or-on
+     * the bbox -- hull cells are clipped, never flagged.
+     *
+     * Returns `0` (never a garbage polygon) when: `i` was a non-finite input
+     * point; the build was degenerate (fewer than 3 finite points, or the
+     * triangulation collapsed -- all-collinear / all-coincident); `i` lost the
+     * triangulator's EPSILON dedup (an exact/near-duplicate that owns no mesh
+     * vertex); or the cell does not intersect the bbox.
+     *
+     * Zero allocation per call.
+     *
+     * @param i original point index; must be an integer in `[0, n)`.
+     * @param bx0 bbox min x
+     * @param by0 bbox min y
+     * @param bx1 bbox max x (must be `> bx0`)
+     * @param by1 bbox max y (must be `> by0`)
+     * @param outXY caller-owned interleaved output buffer.
+     * @returns vertex count written (`0`, or `3 .. outXY.length / 2`).
+     * @throws if the handle has been disposed; if `i` is not an integer in
+     *   `[0, n)`; if the bbox is non-finite or not strictly ordered; or if the
+     *   clipped cell needs more vertices than `outXY` can hold (the loud escape
+     *   -- it never truncates).
+     */
+    cell(
+        i: number,
+        bx0: number,
+        by0: number,
+        bx1: number,
+        by1: number,
+        outXY: Float64Array | Float32Array
+    ): number;
+
+    /**
+     * Release this handle back to its factory pool. The backing mesh arena lives
+     * as long as the factory. Using or double-disposing a disposed handle throws.
+     */
+    dispose(): void;
+}
+
+/**
+ * Builds a {@link CellIndex} over the SoA pixel coordinates `pxs` / `pys` (the
+ * first `n` entries of each; `NaN`/`Infinity` legal, compacted out at build).
+ * `n` must be `<= maxPoints` (throws otherwise). A build allocates one small
+ * handle facade (~48 B, minor-GC-collectible); the mesh arena, circumcenter
+ * arrays and clip buffers are pooled -- 0 B beyond the facade.
+ */
+export type CellIndexFactory = (
+    pxs: ArrayLike<number>,
+    pys: ArrayLike<number>,
+    n: number
+) => CellIndex;
+
+/**
+ * Create a pooled cell-index factory sized for up to `maxPoints` points.
+ *
+ * Mirrors {@link createSpatialIndex} exactly (pooled factory-factory, SoA input,
+ * NaN compaction, ORIGINAL indices, generation-stamped facades) but, instead of
+ * a k-NN grid, builds the Delaunay mesh, precomputes every circumcenter, and
+ * answers `cell(i, ...)` by walking the half-edges around site `i` and CLIPPING
+ * the resulting Voronoi polygon to the caller's axis-aligned bbox with a
+ * zero-allocation Sutherland-Hodgman pass. A build allocates one small handle
+ * facade (~48 B); everything else is pooled and `cell()` is 0 B/query. A new
+ * slot is allocated only at a new concurrent high-water mark.
+ *
+ * SIZING RULE (so callers can size `outXY`): a bbox-clipped Voronoi cell of an
+ * INTERIOR site has at most `degree + 4` vertices, and of a HULL site at most
+ * `degree + 5`. A caller-owned buffer of `2 * 64` floats (64 vertices) covers
+ * every non-adversarial cloud; a clipped cell that needs more makes `cell()`
+ * THROW rather than truncate.
+ *
+ * @param maxPoints hard upper bound on `n` per build. Must be a non-negative
+ *   integer.
+ * @throws if `maxPoints` is not a non-negative integer.
+ */
+export function createCellIndex(maxPoints: number): CellIndexFactory;

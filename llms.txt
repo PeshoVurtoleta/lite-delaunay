@@ -1,6 +1,6 @@
 # @zakkster/lite-delaunay
 
-Version: 1.1.1
+Version: 1.2.0
 
 > Zero-GC 2D Delaunay triangulation. Pre-allocated arena, sweepline algorithm,
 > half-edge mesh output. Built for per-frame use in games and simulations
@@ -120,6 +120,11 @@ away as N grows.
 
 ## Common follow-up: Voronoi from the dual
 
+As of v1.2.0 this circumcenter + cell-walk recipe is BUILT IN and hardened
+(near-degenerate circumcenters fail closed to the triangle centroid, hull cells
+are bbox-clipped, zero allocation) -- see `createCellIndex` below. The manual
+recipe stays here for consumers who want the raw dual rather than clipped cells.
+
 ```js
 // Per-triangle circumcenter scratch -- also allocate once.
 const cxArr = new Float32Array(tri.maxTriangles);
@@ -223,6 +228,100 @@ cause zero MAJOR GC.
 - `factory(pxs, pys, n)` with `n > maxPoints`, `n` not a non-negative integer,
   missing `pxs`/`pys`, or arrays shorter than `n`
 - `findNearest` / `dispose` on a disposed handle; double-dispose
+
+## Cell index (v1.2.0)
+
+A third export, `createCellIndex`, is the charts-facing Voronoi-cell capability:
+a pooled, zero-allocation query that writes a site's Voronoi polygon, CLIPPED to
+a caller-supplied axis-aligned bbox, into a caller-owned buffer. It is what
+`@zakkster/lite-charts` injects to draw a cell tessellation over a projected
+scatter. Unlike `createSpatialIndex` (a uniform grid), this DOES triangulate:
+it builds the Delaunay mesh and precomputes every circumcenter once at build
+time, then `cell(i, ...)` walks the half-edges around site `i`.
+
+```ts
+const createCellIndex: (maxPoints: number) => CellIndexFactory;
+
+type CellIndexFactory = (pxs, pys, n) => CellIndex;   // Float32Array, NaN legal
+
+interface CellIndex {
+  // Write site i's Voronoi polygon, CLIPPED to the bbox, into the caller-owned
+  // interleaved outXY [x0,y0,x1,y1,...]. i is the ORIGINAL point index. Returns
+  // the vertex count written (0, or 3..outXY.length/2). Every returned polygon
+  // is finite, convex, closed (last vertex implicitly connects to first) and
+  // fully inside-or-on the bbox -- hull cells are clipped, never flagged.
+  // Zero allocation per call.
+  //   0 => no cell: i was a non-finite point; the build was degenerate
+  //        (fewer than 3 finite points, or collinear/coincident); i lost the
+  //        EPSILON dedup (a duplicate that owns no mesh vertex); or the cell
+  //        does not intersect the bbox.
+  // THROWS (never truncates) if the clipped cell needs more vertices than outXY
+  // can hold, if i is not an integer in [0, n), if the bbox is non-finite or
+  // not strictly ordered (bx0 < bx1, by0 < by1), or if the handle is disposed.
+  cell(i, bx0, by0, bx1, by1, outXY): number;
+  dispose(): void;
+}
+```
+
+### Sizing rule
+
+A bbox-clipped Voronoi cell of an INTERIOR site has at most `degree + 4`
+vertices, and of a HULL site at most `degree + 5`. A caller-owned buffer of
+`2 * 64` floats (64 vertices) covers every non-adversarial cloud; if a clipped
+cell needs more, `cell()` THROWS rather than truncating -- the loud escape.
+
+### Canonical usage: wiring into a lite-charts config
+
+```js
+import { createCellIndex } from "@zakkster/lite-delaunay";
+
+const chart = createScatterChart({
+  data,
+  // all-or-nothing opt-in; the chart rebuilds the index with the projection
+  // (Voronoi is not affine-invariant under anisotropic scaling) and disposes
+  // the previous one on every data / scale change.
+  cells: { index: createCellIndex(20_000), colorKey: 'zone' },
+});
+```
+
+Cells are PIXEL-space, rebuilt with the projection. The chart calls
+`factory(pxs, pys, n)` at extract time, then per frame walks each visible
+`cell(i, bx0, by0, bx1, by1, outXY)` at 0 B, filling from a per-point color
+accessor. Charts passes the plot bounds as the bbox, so every cell it receives
+is finite and closed, or absent.
+
+### Fail-closed list
+
+- A non-finite input point (`NaN`/`Infinity`) is compacted out at build; its
+  `cell(i)` returns `0`.
+- Near-degenerate circumcenters (denominator ~ 0) fail closed to the triangle
+  centroid -- no `Infinity`/`NaN` vertex is ever stored.
+- Degenerate build (fewer than 3 finite points, or all-collinear/coincident so
+  the triangulation is empty): every `cell(i)` returns `0`.
+- An exact/near-duplicate that lost the EPSILON dedup owns no mesh cell; exactly
+  one of a set of duplicates returns the polygon, the rest return `0`.
+- Hull sites (unbounded in the true diagram) are closed by three synthetic far
+  points that provably fall outside the bbox, so the clip yields
+  cell-intersect-bbox exactly -- the far-fan is invisible to the caller.
+
+### Pool / dispose semantics
+
+Identical to `createSpatialIndex`: one factory serves many concurrent live
+handles, each build acquires a pooled slot and each `dispose()` returns it, a
+new slot is allocated only at a new concurrent high-water mark, and a build
+allocates exactly one small handle facade (~48 B, minor-GC-collectible) -- 0 B
+beyond it, and `cell()` is 0 B/query. The facade carries a generation stamp:
+using or double-disposing a disposed handle THROWS, and a stale handle onto a
+rebuilt slot THROWS rather than returning the new build's cells.
+
+### Throws
+
+- `createCellIndex(x)` with x not a non-negative integer
+- `factory(pxs, pys, n)` with `n > maxPoints`, `n` not a non-negative integer,
+  missing `pxs`/`pys`, or arrays shorter than `n`
+- `cell(i, ...)` with `i` not an integer in `[0, n)`, a non-finite or
+  non-strictly-ordered bbox, an `outXY` too small for the clipped cell, or on a
+  disposed handle; `dispose` double-dispose
 
 ## Anti-patterns to avoid
 

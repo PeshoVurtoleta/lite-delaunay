@@ -40,6 +40,7 @@ Same sweepline algorithm as [Mapbox Delaunator](https://github.com/mapbox/delaun
 - [Reading the output](#reading-the-output)
 - [Use case: Voronoi from the dual graph](#use-case-voronoi-from-the-dual-graph)
 - [Spatial index: hit-testing dense point clouds](#spatial-index-hit-testing-dense-point-clouds)
+- [Cell index: bbox-clipped Voronoi cells](#cell-index-bbox-clipped-voronoi-cells)
 - [API reference](#api-reference)
 - [Benchmarks](#benchmarks)
 - [Testing](#testing)
@@ -376,6 +377,77 @@ For pure radius-bounded k-NN a uniform grid is simpler and, on the clustered pix
 - **Per-slot memory** is approximately `24 * maxPoints` bytes plus the grid-cell arrays (`~ maxPoints` cells). Peak scales with the concurrent high-water mark of live handles, not the number of rebuilds.
 
 The `node --expose-gc test/torture.mjs` gate proves all of this: 0 major GCs across ~200k stepped queries, `tracker.size()` back to 0 after 4096 build/dispose cycles, and a rebuild-churn subphase whose heap growth (after the facades are collected) stays in the noise floor.
+
+---
+
+## Cell index: bbox-clipped Voronoi cells
+
+**New in 1.2.0.** Where `createSpatialIndex` answers "which points are nearest?", `createCellIndex` answers "what region does each point own?" -- it hands you a site's **Voronoi cell**, clipped to an axis-aligned bounding box, ready to fill. This is the capability behind Voronoi-tessellation charts (every reading owns a colored region -- the classic station-map / coverage view) and exact fat-hover targets (the Voronoi cell *is* the nearest-neighbor hit region).
+
+Unlike the spatial index, this one **does triangulate**: it builds the Delaunay mesh and precomputes every triangle circumcenter once at build time, then `cell(i, ...)` walks the half-edges around site `i` and clips the resulting polygon with a zero-allocation Sutherland-Hodgman pass. It is the interface `@zakkster/lite-charts` injects for its scatter `cells` layer, wired in one line:
+
+```js
+import { createCellIndex } from '@zakkster/lite-delaunay';
+
+const chart = createScatterChart({
+  data,
+  // all-or-nothing opt-in; cells are PIXEL-space and rebuilt with the
+  // projection (Voronoi is not affine-invariant under anisotropic scaling).
+  cells: { index: createCellIndex(20_000), colorKey: 'zone' },
+});
+```
+
+Under the hood the factory is `(pxs, pys, n) -> CellIndex`:
+
+```js
+const factory = createCellIndex(20_000);
+const index = factory(pxs, pys, n);   // SoA pixel coords in, allocation-free handle out
+
+// Caller owns the output buffer; 64 vertices covers every non-adversarial cloud.
+const outXY = new Float64Array(2 * 64);
+
+// Per cell: write site i's polygon clipped to the plot bounds, get the vertex count.
+const count = index.cell(i, plotX0, plotY0, plotX1, plotY1, outXY);
+if (count >= 3) {
+  ctx.beginPath();
+  ctx.moveTo(outXY[0], outXY[1]);
+  for (let k = 1; k < count; k++) ctx.lineTo(outXY[2 * k], outXY[2 * k + 1]);
+  ctx.closePath();
+  ctx.fill();   // fill from a per-point color accessor
+}
+
+index.dispose();   // dispose before rebuilding on a data / scale change
+```
+
+Every polygon you receive is finite, convex, closed (the last vertex implicitly connects to the first), and lies fully inside-or-on the bbox -- **hull cells are clipped, never flagged**. A hull site's unbounded cell is closed by three synthetic far points that provably fall outside the bbox, so the clip yields cell-intersect-bbox *exactly*; the far-fan is invisible to the caller and adjacent cells tile the bbox with no seams or overlaps.
+
+### Sizing rule
+
+A bbox-clipped Voronoi cell of an **interior** site has at most `degree + 4` vertices, and of a **hull** site at most `degree + 5`. A caller-owned buffer of `2 * 64` floats (64 vertices) covers every non-adversarial cloud; if a clipped cell needs more, `cell()` **throws** rather than truncating into a garbage shape -- the loud escape.
+
+### Contract
+
+| Member | Signature | Notes |
+|---|---|---|
+| `createCellIndex` | `(maxPoints) -> CellIndexFactory` | Throws if `maxPoints` is not a non-negative integer. |
+| factory | `(pxs, pys, n) -> CellIndex` | `NaN`/`Infinity` legal (compacted out). Throws if `n > maxPoints`, `n` is not a non-negative integer, `pxs`/`pys` are missing, or shorter than `n`. |
+| `cell` | `(i, bx0, by0, bx1, by1, outXY) -> count` | `i` is the ORIGINAL index. Writes the clipped polygon into interleaved `outXY`, returns `0` or `3..outXY.length/2`. Throws on out-of-range `i`, a non-finite / non-strictly-ordered bbox, an `outXY` too small, or a disposed handle. |
+| `dispose` | `() -> void` | Returns the handle to the factory pool. Using or double-disposing a disposed handle throws. |
+
+### Fail-closed semantics
+
+`cell(i)` returns `0` (never a garbage polygon) when:
+
+- **`i` was a non-finite input point** -- compacted out at build; it owns no cell.
+- **The build was degenerate** -- fewer than 3 finite points, or all-collinear / all-coincident so the triangulation is empty. Every `cell(i)` returns `0` (the charts layer draws markers with no cells -- fail closed, never a wrong polygon).
+- **`i` lost the EPSILON dedup** -- of a set of exact/near-duplicate points, exactly one owns the mesh vertex and returns the polygon; the rest return `0`.
+- **The cell does not intersect the bbox** -- including a clip that degenerates below 3 vertices.
+
+Near-degenerate circumcenters (denominator ~ 0) fail closed to the triangle centroid, so no `Infinity`/`NaN` vertex is ever stored.
+
+### Zero-GC design, including the pool
+
+Pooling, the ~48 B per-build facade, and generation-stamped fail-closed handles are **identical to the spatial index** above: one factory serves many concurrent live handles, a build acquires a pooled slot and a dispose returns it, a new slot is allocated only at a new concurrent high-water mark, and `cell()` is 0 B/query. The mesh arena, circumcenter arrays and Sutherland-Hodgman ping-pong buffers are all pooled -- 0 B beyond the facade. The torture gate proves 0 major GC across a rebuild storm and ~200k `cell()` queries, with `tracker.size()` back to 0 after the build/dispose cycles.
 
 ---
 

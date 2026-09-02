@@ -22,13 +22,19 @@ import {
 } from '@zakkster/lite-leak';
 import { effect } from '@zakkster/lite-signal';
 
-import { createSpatialIndex } from '../Delaunay.js';
+import { createSpatialIndex, createCellIndex } from '../Delaunay.js';
 
 const CYCLES = 4096;
 const HOT = 200000;
 const N = 5000;
 const MAXP = 5000;
 const K = 8;
+// Cell index runs on a smaller, well-SPREAD cloud (real triangulation +
+// hull-fan geometry, not the spatial cluster torture) with fewer rebuild
+// cycles -- triangulating N points per build is far heavier than a grid rebuild.
+const CELL_N = 1200;
+const CELL_CYCLES = 512;
+const CELL_HOT = 200000;
 
 // --- skewed clustered input with ~5% NaN (log-scale / missing-data holes) ---
 // A 10^4:1 density skew: a few tight clusters near the origin plus rare far
@@ -55,6 +61,21 @@ for (let i = 0; i < N; i++) {
 }
 const maxDistSq = 64 * 64;  // charts' prMaxSq: a plausible max bubble radius^2
 
+// --- spread cloud for the cell index: uniform over a 1000x1000 box, ~3% NaN ---
+// Well-separated points so triangulate() produces a rich mesh with real hull
+// sites (the far-fan path) -- the geometry the cell surface must survive.
+const cellPxs = new Float32Array(CELL_N);
+const cellPys = new Float32Array(CELL_N);
+for (let i = 0; i < CELL_N; i++) {
+  let x = rng() * 1000, y = rng() * 1000;
+  if (rng() < 0.03) { x = NaN; }  // ~3% NaN holes -- compacted out at build
+  cellPxs[i] = x; cellPys[i] = y;
+}
+// A bbox that clips the diagram: strictly inside the point cloud so interior
+// AND hull cells both get exercised, and some outlier cells fall fully outside.
+const cbx0 = 100, cby0 = 100, cbx1 = 900, cby1 = 900;
+const cellOut = new Float64Array(128);  // 64-vertex caller buffer (the sizing rule)
+
 // ---------------------------------------------------------------------------
 // leak tracker + kernels
 // ---------------------------------------------------------------------------
@@ -79,8 +100,19 @@ const slotWatch = [];
   slotWatch.push(h._slot);   // watch the pooled SLOT, not the per-build facade
   h.dispose();
 }
+// Same pooling contract for the cell index: one factory, slot HWM watched by
+// identity. A pool that leaked a slot per build would grow this unbounded.
+const cellFactory = createCellIndex(MAXP);
+const cellSlotWatch = [];
+{
+  const h = cellFactory(cellPxs, cellPys, CELL_N);
+  cellSlotWatch.push(h._slot);
+  h.dispose();
+}
+// One growth kernel watches BOTH pools' HWM (the kernel name is unique per
+// registration, so both collections ride a single registration).
 tracker.registerKernel(createCollectionGrowthKernel({
-  collections: [slotWatch],
+  collections: [slotWatch, cellSlotWatch],
   window: 8,
   minSamples: 4,
 }));
@@ -108,6 +140,31 @@ for (let i = 0; i < CYCLES; i++) {
     handle.dispose();
   });
   dispose();  // owner disposal -> onCleanup(untrack) -> size decrements
+}
+
+// ---------------------------------------------------------------------------
+// phase 1c: cell-index rebuild storm -- build/dispose cycles interleaved with
+// cell() queries into a fixed 128-float buffer, tracked by lite-leak. Proves
+// the slot is released back to the pool every cycle (size() returns to 0) and
+// the pool HWM stays flat (growth kernel on cellSlotWatch).
+// ---------------------------------------------------------------------------
+for (let i = 0; i < CELL_CYCLES; i++) {
+  const dispose = effect(() => {
+    const handle = cellFactory(cellPxs, cellPys, CELL_N);
+    const slot = handle._slot;
+    let known = false;
+    for (let s = 0; s < cellSlotWatch.length; s++) {
+      if (cellSlotWatch[s] === slot) { known = true; break; }
+    }
+    if (!known) cellSlotWatch.push(slot);
+    // Exercise the query path each cycle: a spread of sites into the fixed buffer.
+    handle.cell(i % CELL_N, cbx0, cby0, cbx1, cby1, cellOut);
+    handle.cell((i * 7 + 3) % CELL_N, cbx0, cby0, cbx1, cby1, cellOut);
+    const gen = handle._gen | 0;  // detached primitive, never the handle
+    tracker.track(handle, () => { void gen; }, 'cell', { audit: true });
+    handle.dispose();
+  });
+  dispose();
 }
 
 globalThis.gc?.();
@@ -166,9 +223,30 @@ const rebuildBytes = heapAfter - heapBefore;
 const REBUILD_LIMIT = 64 * 1024;
 
 // ---------------------------------------------------------------------------
+// phase 3: cell-index steady-state -- one build, ~200k cell(i % n) queries into
+// the fixed buffer. cell() must be 0 B/call (major=0). Sites cycle through NaN
+// holes (return 0), interior cells, and hull cells (the far-fan path).
+// ---------------------------------------------------------------------------
+const gcCell = new GcProfiler().start();
+const cellIndex = cellFactory(cellPxs, cellPys, CELL_N);  // built ONCE
+for (let i = 0; i < CELL_HOT; i++) {
+  cellIndex.cell(i % CELL_N, cbx0, cby0, cbx1, cby1, cellOut);
+  if ((i & 8191) === 0) {
+    gcCell.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+  }
+}
+cellIndex.dispose();
+
+await new Promise((r) => setTimeout(r, 50));
+const sCell = gcCell.summary();
+const reportCell = checkNoGc(sCell, { maxMajor: 0, maxPauseMs: 4 });
+gcCell.stop();
+
+// ---------------------------------------------------------------------------
 // gate
 // ---------------------------------------------------------------------------
 const ok = report.ok &&
+  reportCell.ok &&
   live === 0 &&
   leaks.length === 0 &&
   findings.length === 0 &&
@@ -179,12 +257,17 @@ console.log(
   ' warnings=' + warns.length +
   ' | gc major=' + s.gc.major + ' minor=' + s.gc.minor +
   ' maxMs=' + s.gc.maxMs.toFixed(2) +
+  ' | cell major=' + sCell.gc.major + ' minor=' + sCell.gc.minor +
+  ' maxMs=' + sCell.gc.maxMs.toFixed(2) +
   ' | rebuild=' + rebuildBytes + ' bytes | ' + (ok ? 'ok' : 'FAIL')
 );
 
 if (!ok) {
   for (const v of report.violations) {
     console.error('  violation ' + v.metric + ' limit=' + v.limit + ' actual=' + v.actual);
+  }
+  for (const v of reportCell.violations) {
+    console.error('  cell-violation ' + v.metric + ' limit=' + v.limit + ' actual=' + v.actual);
   }
   for (const f of findings) console.error('  finding ' + f.kind + ':' + (f.reason || ''));
   for (const l of leaks) console.error('  leak ' + l);

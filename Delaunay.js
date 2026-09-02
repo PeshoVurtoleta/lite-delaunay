@@ -36,7 +36,7 @@
  * are bumped in the same commit or not at all (packaging law).
  * @type {string}
  */
-export const VERSION = "1.1.1";
+export const VERSION = "1.2.0";
 
 // IEEE 754 double machine-epsilon. Used for the near-duplicate-point skip
 // in the advancing-front loop (matches Mapbox Delaunator's tolerance).
@@ -1017,6 +1017,526 @@ export const createSpatialIndex = (maxPoints) => {
         // Fresh minimal facade (~48 B). Methods come from the frozen shared
         // proto, so nothing beyond this object is allocated.
         const facade = Object.create(SPATIAL_FACADE_PROTO);
+        facade._slot = slot;
+        facade._gen = slot.gen;
+        return facade;
+    };
+};
+
+// ===========================================================================
+// Cell index (v1.2.0) -- charts-facing bbox-clipped Voronoi cell surface.
+// ===========================================================================
+//
+// `createCellIndex(maxPoints)` returns a BUILD function matching the
+// CellIndexFactory contract @zakkster/lite-charts injects to draw a Voronoi
+// tessellation over a projected scatter (see LiteCharts/briefs/voronoi-cells.md,
+// "The consumer contract"):
+//
+//   type CellIndexFactory = (pxs, pys, n) -> CellIndex
+//   interface CellIndex {
+//     cell(i, bx0, by0, bx1, by1, outXY) -> vertexCount   // ORIGINAL index i
+//     dispose() -> void
+//   }
+//
+// Unlike createSpatialIndex (a uniform grid), this DOES triangulate: it builds
+// the Delaunay mesh once at build time, computes every triangle circumcenter
+// once, and cell(i) walks the half-edges around site i to assemble that site's
+// Voronoi polygon -- then CLIPS it to the caller's axis-aligned bbox with a
+// zero-allocation Sutherland-Hodgman pass. Every returned polygon is finite,
+// convex, closed (last vertex implicitly connects to first) and lies fully
+// inside-or-on the bbox; a hull cell (unbounded in the true diagram) is closed
+// by three synthetic far points that provably fall outside the bbox, so the
+// clip result equals cell-intersect-bbox exactly -- no open-cell flag ever
+// escapes. cell() writes into caller-owned interleaved outXY [x0,y0,x1,y1,...]
+// and allocates nothing.
+//
+// Pooling / facade / generation semantics are IDENTICAL to createSpatialIndex:
+// one factory, many concurrent handles; a build acquires a pooled slot and
+// bumps its generation stamp; dispose bumps it again and returns the slot; a
+// stale or disposed facade THROWS. A build allocates exactly one small facade
+// (~48 B, young-gen). cell() is 0 B/query.
+
+/**
+ * Clip a convex polygon against a single axis-aligned half-plane
+ * (Sutherland-Hodgman, one plane). Reads `inCount` interleaved vertices from
+ * `inP`, writes the clipped interleaved vertices to `outP`, returns the new
+ * vertex count. Zero allocation: a module-level function (never a per-build
+ * closure), all state in f64 locals, intersection parameter in full f64.
+ *
+ * @param {Float64Array} inP  interleaved input polygon [x0,y0,x1,y1,...]
+ * @param {number} inCount    input vertex count
+ * @param {Float64Array} outP interleaved output buffer (caller guarantees room)
+ * @param {number} axis       0 = clip on x, 1 = clip on y
+ * @param {number} lim        the plane coordinate (bx0/bx1/by0/by1)
+ * @param {boolean} keepGreater true keeps coord >= lim, false keeps coord <= lim
+ * @returns {number} output vertex count
+ */
+function _clipHalfPlane(inP, inCount, outP, axis, lim, keepGreater) {
+    let outCount = 0;
+    let px = inP[2 * (inCount - 1)], py = inP[2 * (inCount - 1) + 1];
+    let pCoord = axis === 0 ? px : py;
+    let pInside = keepGreater ? (pCoord >= lim) : (pCoord <= lim);
+    for (let k = 0; k < inCount; k++) {
+        const cx = inP[2 * k], cy = inP[2 * k + 1];
+        const cCoord = axis === 0 ? cx : cy;
+        const cInside = keepGreater ? (cCoord >= lim) : (cCoord <= lim);
+        if (cInside) {
+            if (!pInside) {
+                // Crossing into the half-plane: emit the boundary intersection.
+                const t = (lim - pCoord) / (cCoord - pCoord);
+                outP[2 * outCount] = px + t * (cx - px);
+                outP[2 * outCount + 1] = py + t * (cy - py);
+                outCount++;
+            }
+            outP[2 * outCount] = cx;
+            outP[2 * outCount + 1] = cy;
+            outCount++;
+        } else if (pInside) {
+            // Crossing out of the half-plane: emit the boundary intersection.
+            const t = (lim - pCoord) / (cCoord - pCoord);
+            outP[2 * outCount] = px + t * (cx - px);
+            outP[2 * outCount + 1] = py + t * (cy - py);
+            outCount++;
+        }
+        px = cx; py = cy; pCoord = cCoord; pInside = cInside;
+    }
+    return outCount;
+}
+
+/**
+ * Write site `i`'s bbox-clipped Voronoi polygon into `outXY` and return its
+ * vertex count. `i` is the ORIGINAL point index (as passed to the factory).
+ * Zero allocation.
+ *
+ * Returns 0 (never a garbage polygon) when: `i` was a non-finite input point;
+ * the build was degenerate (fewer than 3 finite points, or triangulate()
+ * produced 0 triangles); `i` lost the triangulator's EPSILON dedup (an exact/
+ * near-duplicate that owns no mesh vertex); or the cell does not intersect the
+ * bbox (including a clip result that degenerates below 3 vertices).
+ *
+ * @this {object} per-build cell-index facade ({ _slot, _gen })
+ * @param {number} i original point index
+ * @param {number} bx0 bbox min x
+ * @param {number} by0 bbox min y
+ * @param {number} bx1 bbox max x (must be > bx0)
+ * @param {number} by1 bbox max y (must be > by0)
+ * @param {Float64Array|Float32Array} outXY caller-owned interleaved output
+ * @returns {number} vertex count written (0, or 3..outXY.length/2)
+ * @throws {Error} if the handle is disposed, `i` is not an integer in [0, n),
+ *   the bbox is non-finite or not strictly ordered, or outXY is too small for
+ *   the clipped cell (the loud escape -- never truncates)
+ */
+function _cellQuery(i, bx0, by0, bx1, by1, outXY) {
+    // Generation stamp: stale (reused-slot) or disposed facade fails closed.
+    const s = this._slot;
+    if (s === null || this._gen !== s.gen) {
+        throw new Error("lite-delaunay: cell called on a disposed cell index");
+    }
+    // `i` must be a valid original index -- fail LOUD (an out-of-range i is a
+    // caller bug, not a missing cell).
+    const n = s.n;
+    if (!Number.isInteger(i) || i < 0 || i >= n) {
+        throw new Error(`lite-delaunay: cell index i (${i}) out of range [0, ${n})`);
+    }
+    // bbox must be finite and strictly ordered -- a zero/negative-area or
+    // non-finite bbox is an unverified caller state, not a degenerate cell.
+    if (bx0 !== bx0 || by0 !== by0 || bx1 !== bx1 || by1 !== by1 ||
+        bx0 === Infinity || bx0 === -Infinity || by0 === Infinity || by0 === -Infinity ||
+        bx1 === Infinity || bx1 === -Infinity || by1 === Infinity || by1 === -Infinity ||
+        !(bx0 < bx1) || !(by0 < by1)) {
+        throw new Error("lite-delaunay: cell bbox must be finite with bx0 < bx1 and by0 < by1");
+    }
+
+    // Degenerate build -> no cells for anyone.
+    if (s.degenerate) return 0;
+
+    // Map original index -> compacted vertex; -1 means the point was non-finite
+    // (never compacted). inEdge -1 means the vertex lost the triangulator's
+    // EPSILON dedup and owns no mesh cell.
+    const v = s.orig2v[i];
+    if (v === -1) return 0;
+    const inEdge = s.inEdge;
+    const e0 = inEdge[v];
+    if (e0 === -1) return 0;
+
+    const tri = s.tri;
+    const triangles = tri.triangles;
+    const halfedges = tri.halfedges;
+    const ccx = s.ccx, ccy = s.ccy;
+    const S = s.scratch;
+    const polyA = s.polyA, polyB = s.polyB;
+    const maxPoints = s.maxPoints;
+
+    const sx = S[2 * v], sy = S[2 * v + 1];
+
+    // --- Fan walk (d3-delaunay cell walk) ---------------------------------
+    // Collect the circumcenter of each triangle incident to v, in order around
+    // v. inEdge's hull-priority guarantees an OPEN fan starts at one hull edge
+    // and ends at the other, covering every incident triangle exactly once.
+    let e = e0;
+    let count = 0;
+    let open = false;
+    let lastNe = -1; // outgoing hull half-edge, set only on an open fan
+    do {
+        // Safety: a valid fan has at most (m - 1) circumcenters; anything more
+        // is a malformed-mesh cycle -- fail closed rather than overrun polyA.
+        if (count >= maxPoints) return 0;
+        const t = (e / 3) | 0;
+        polyA[2 * count] = ccx[t];
+        polyA[2 * count + 1] = ccy[t];
+        count++;
+        // nextHalfedge(e): e in {3t,3t+1,3t+2} -> the next edge of triangle t.
+        const ne = (e % 3 === 2) ? e - 2 : e + 1;
+        // Defensive: on a well-formed mesh every walked edge is incoming to v,
+        // so triangles[nextHalfedge(e)] === v always. If that invariant is ever
+        // broken, fail closed -- never build a far fan from a mislabeled edge.
+        if (triangles[ne] !== v) return 0;
+        e = halfedges[ne];
+        if (e === -1) { lastNe = ne; open = true; break; }             // hull end
+    } while (e !== e0);
+
+    // --- Hull far-fan -----------------------------------------------------
+    // For an open cell, close the fan with three synthetic far points so the
+    // subsequent bbox clip yields cell-intersect-bbox exactly. The two boundary
+    // Voronoi rays are dual to the two hull edges at the site: each emanates
+    // from ITS circumcenter (c0 for the start edge, c_last for the end edge) in
+    // the outward perpendicular-bisector direction of that hull edge. The far
+    // ray tips MUST be anchored at those circumcenters (not the site), otherwise
+    // the chord back to the circumcenter is tilted off the true ray and the
+    // clipped cells no longer tile the bbox.
+    if (open) {
+        // Start hull edge (p -> v): the incoming hull edge e0 (halfedges[e0]==-1).
+        // Its triangle's third vertex = sum of the triangle's three vertex ids
+        // minus p and v (the ids are distinct, so the sum trick is exact).
+        const t0 = (e0 / 3) | 0;
+        const p = triangles[e0];
+        const third0 = triangles[3 * t0] + triangles[3 * t0 + 1] + triangles[3 * t0 + 2] - p - v;
+        const px = S[2 * p], py = S[2 * p + 1];
+        // Edge direction p->v and the two candidate normals (dy,-dx)/(-dy,dx).
+        // Pick the one pointing AWAY from the third vertex: the mesh sits on the
+        // third-vertex side, so the outward Voronoi ray points the other way.
+        // (Sign is derived per-triangle so it holds under either hull winding
+        // the triangulator emits -- see the CCW note at the top of this file.)
+        let ex0 = sx - px, ey0 = sy - py;
+        const mx0 = (px + sx) * 0.5, my0 = (py + sy) * 0.5;
+        const tx0 = S[2 * third0], ty0 = S[2 * third0 + 1];
+        let ux = ey0, uy = -ex0;
+        if (ux * (tx0 - mx0) + uy * (ty0 - my0) > 0) { ux = -ey0; uy = ex0; }
+        const ul = Math.sqrt(ux * ux + uy * uy);
+        if (!(ul > 0)) return 0; // degenerate hull edge -- fail closed
+        ux /= ul; uy /= ul;
+
+        // End hull edge (v -> q): the outgoing hull edge lastNe.
+        const tL = (lastNe / 3) | 0;
+        const qne = (lastNe % 3 === 2) ? lastNe - 2 : lastNe + 1;
+        const q = triangles[qne];
+        const third1 = triangles[3 * tL] + triangles[3 * tL + 1] + triangles[3 * tL + 2] - v - q;
+        const qx = S[2 * q], qy = S[2 * q + 1];
+        let ex1 = qx - sx, ey1 = qy - sy;
+        const mx1 = (sx + qx) * 0.5, my1 = (sy + qy) * 0.5;
+        const tx1 = S[2 * third1], ty1 = S[2 * third1 + 1];
+        let wx = ey1, wy = -ex1;
+        if (wx * (tx1 - mx1) + wy * (ty1 - my1) > 0) { wx = -ey1; wy = ex1; }
+        const wl = Math.sqrt(wx * wx + wy * wy);
+        if (!(wl > 0)) return 0;
+        wx /= wl; wy /= wl;
+
+        // Bisector b = normalize(u + w). u+w vanishes only at a ~180deg aperture
+        // (float pathology: a real hull-vertex aperture is < 180deg); fail
+        // closed to the perpendicular of u turned toward w's side.
+        let bx = ux + wx, by = uy + wy;
+        const blb = Math.sqrt(bx * bx + by * by);
+        if (blb > 1e-9) {
+            bx /= blb; by /= blb;
+        } else {
+            bx = -uy; by = ux;
+            if (bx * wx + by * wy < 0) { bx = uy; by = -ux; }
+        }
+
+        // The ray tips anchor at their circumcenters; the bisector tip anchors
+        // at the site. FAR must dominate BOTH the bbox extent C (farthest bbox
+        // corner from the site) AND D (site-to-circumcenter distance), so all
+        // three far points and both bridge chords (far_w -> far_b -> far_u,
+        // split by the bisector so each subtends < 90deg) clear the bbox: with
+        // FAR = 3*(C + D) the bridge clearance is >= FAR*cos45 - D > C. The two
+        // ray edges (far_u -> c0, c_last -> far_w) lie exactly on the true rays,
+        // so the clip yields cell-intersect-bbox exactly.
+        const c0x = ccx[t0], c0y = ccy[t0];
+        const cLx = ccx[tL], cLy = ccy[tL];
+        const dxm = Math.max(Math.abs(sx - bx0), Math.abs(sx - bx1));
+        const dym = Math.max(Math.abs(sy - by0), Math.abs(sy - by1));
+        const C = Math.sqrt(dxm * dxm + dym * dym);
+        const d0 = Math.sqrt((c0x - sx) * (c0x - sx) + (c0y - sy) * (c0y - sy));
+        const dL = Math.sqrt((cLx - sx) * (cLx - sx) + (cLy - sy) * (cLy - sy));
+        const D = d0 > dL ? d0 : dL;
+        const FAR = 3 * (C + D);
+
+        // Append after the last circumcenter, in fan order: far(w), far(b), far(u).
+        polyA[2 * count] = cLx + FAR * wx; polyA[2 * count + 1] = cLy + FAR * wy; count++;
+        polyA[2 * count] = sx + FAR * bx; polyA[2 * count + 1] = sy + FAR * by; count++;
+        polyA[2 * count] = c0x + FAR * ux; polyA[2 * count + 1] = c0y + FAR * uy; count++;
+    }
+
+    if (count < 3) return 0;
+
+    // --- Clip against the four bbox half-planes (ping-pong polyA<->polyB) ---
+    count = _clipHalfPlane(polyA, count, polyB, 0, bx0, true);  // x >= bx0
+    if (count < 3) return 0;
+    count = _clipHalfPlane(polyB, count, polyA, 0, bx1, false); // x <= bx1
+    if (count < 3) return 0;
+    count = _clipHalfPlane(polyA, count, polyB, 1, by0, true);  // y >= by0
+    if (count < 3) return 0;
+    count = _clipHalfPlane(polyB, count, polyA, 1, by1, false); // y <= by1
+    if (count < 3) return 0;
+
+    // Fail LOUD if the caller's buffer cannot hold the clipped cell -- never
+    // truncate a polygon into a garbage shape.
+    if (2 * count > outXY.length) {
+        throw new Error(`lite-delaunay: outXY too small for ${count}-vertex cell`);
+    }
+    for (let k = 0; k < count; k++) {
+        outXY[2 * k] = polyA[2 * k];
+        outXY[2 * k + 1] = polyA[2 * k + 1];
+    }
+    return count;
+}
+
+/**
+ * Release a per-build cell-index facade and return its pooled slot to the
+ * factory. Identical semantics to `_spatialDispose`: bump the slot generation
+ * (invalidating every outstanding facade of this build), detach this facade so
+ * a second dispose fails closed, and push the slot back on the free stack.
+ *
+ * @this {object} per-build cell-index facade ({ _slot, _gen })
+ * @throws {Error} if already disposed / stale
+ */
+function _cellDispose() {
+    const s = this._slot;
+    if (s === null || this._gen !== s.gen) {
+        throw new Error("lite-delaunay: dispose called on an already-disposed cell index");
+    }
+    this._slot = null;
+    s.gen++;
+    const pool = s._pool;
+    pool.freeStack[pool.freeCount++] = s.poolIndex;
+}
+
+/**
+ * Frozen shared prototype for the per-build cell-index facade. Both methods
+ * live here ONCE, so a build never allocates fresh closures.
+ */
+const CELL_FACADE_PROTO = Object.freeze({
+    cell: _cellQuery,
+    dispose: _cellDispose,
+});
+
+/**
+ * Allocate one pooled cell-index slot: the triangulator arena, the interleave
+ * scratch, per-triangle circumcenter arrays, the inEdge / orig2v maps, and the
+ * Sutherland-Hodgman ping-pong buffers. Only ever called at a new concurrent
+ * high-water mark. The slot carries no methods -- callers only touch it through
+ * a facade.
+ *
+ * @param {number} maxPoints capacity
+ * @param {object} pool the factory's pool bookkeeping
+ * @param {number} poolIndex this slot's index in pool.slots
+ * @returns {object} the pooled slot
+ */
+function _createCellSlot(maxPoints, pool, poolIndex) {
+    const maxTriangles = Math.max(2 * maxPoints - 5, 0);
+    return {
+        _pool: pool,
+        poolIndex,
+        // Generation stamp: bumped on every build and every dispose.
+        gen: 0,
+        maxPoints,
+        // Per-build state (set by _buildCellSlot).
+        n: 0, m: 0, triCount: 0, degenerate: true,
+        // The mesh engine and its f64 interleave scratch [x0,y0,x1,y1,...].
+        tri: new DelaunayTriangulator(maxPoints),
+        scratch: new Float64Array(2 * maxPoints),
+        // Compacted finite coords (kept for parity with the spatial slot).
+        cxs: new Float32Array(maxPoints),
+        cys: new Float32Array(maxPoints),
+        // Per-triangle circumcenters, computed once per build.
+        ccx: new Float64Array(maxTriangles),
+        ccy: new Float64Array(maxTriangles),
+        // inEdge[v] = an incoming half-edge for compacted vertex v (-1 = none,
+        // i.e. the vertex lost the EPSILON dedup); orig2v[i] = compacted vertex
+        // for original index i (-1 = non-finite / no cell).
+        inEdge: new Int32Array(maxPoints),
+        orig2v: new Int32Array(maxPoints),
+        // Sutherland-Hodgman ping-pong scratch. A hull fan is at most (m-1)
+        // circumcenters + 3 far points, and each of the 4 clip planes adds at
+        // most 1 vertex, so maxPoints + 8 vertices is a safe cap.
+        polyA: new Float64Array(2 * (maxPoints + 8)),
+        polyB: new Float64Array(2 * (maxPoints + 8)),
+    };
+}
+
+/**
+ * (Re)build the mesh + circumcenters for a slot from SoA pixel coordinates.
+ * Compacts only finite points, triangulates, computes every circumcenter once,
+ * and builds the inEdge map. Zero allocation.
+ *
+ * @param {object} slot the pooled slot
+ * @param {ArrayLike<number>} pxs x coordinates
+ * @param {ArrayLike<number>} pys y coordinates
+ * @param {number} n logical point count
+ */
+function _buildCellSlot(slot, pxs, pys, n) {
+    const cxs = slot.cxs, cys = slot.cys, orig2v = slot.orig2v, S = slot.scratch;
+    slot.n = n;
+    slot.degenerate = true;
+    slot.triCount = 0;
+
+    // 1. Compact ONLY finite points; record original index -> compacted vertex
+    //    and interleave the compacted coords into the f64 scratch in one pass.
+    //    (x !== x style, no Number.isFinite in the loop.)
+    orig2v.fill(-1, 0, n);
+    let m = 0;
+    for (let i = 0; i < n; i++) {
+        const px = pxs[i], py = pys[i];
+        if (px !== px || py !== py ||
+            px === Infinity || px === -Infinity ||
+            py === Infinity || py === -Infinity) {
+            continue;
+        }
+        cxs[m] = px; cys[m] = py; orig2v[i] = m;
+        S[2 * m] = px; S[2 * m + 1] = py;
+        m++;
+    }
+    slot.m = m;
+
+    // Fewer than 3 finite points: no triangulation exists -- every cell() is 0.
+    if (m < 3) return;
+
+    const triCount = slot.tri.triangulate(S, m);
+    if (triCount === 0) return; // collinear / coincident -- degenerate stays true
+    slot.triCount = triCount;
+    slot.degenerate = false;
+
+    const tri = slot.tri;
+    const triangles = tri.triangles;
+    const halfedges = tri.halfedges;
+    const ccx = slot.ccx, ccy = slot.ccy;
+
+    // 2. Compute ALL circumcenters once.
+    for (let t = 0; t < triCount; t++) {
+        const ia = triangles[3 * t], ib = triangles[3 * t + 1], ic = triangles[3 * t + 2];
+        const ax = S[2 * ia], ay = S[2 * ia + 1];
+        const bx = S[2 * ib], by = S[2 * ib + 1];
+        const cx = S[2 * ic], cy = S[2 * ic + 1];
+        const dx = bx - ax, dy = by - ay, ex = cx - ax, ey = cy - ay;
+        const bl = dx * dx + dy * dy, cl = ex * ex + ey * ey;
+        const D = dx * ey - dy * ex;
+        const scale = bl + cl;
+        // Relative degeneracy guard: |D| is twice the triangle area; when it
+        // drops to EPSILON*scale the 0.5/D division would overflow toward
+        // Infinity, so fail closed to the centroid (finite, inside the
+        // triangle). This fires only on the overflow boundary -- ordinary thin
+        // triangles keep their finite, far true circumcenters (the clip copes).
+        // The `!(|D| > ...)` form also catches a NaN denominator.
+        if (scale === 0 || !(Math.abs(D) > EPSILON * scale)) {
+            ccx[t] = (ax + bx + cx) / 3;
+            ccy[t] = (ay + by + cy) / 3;
+        } else {
+            const d = 0.5 / D;
+            ccx[t] = ax + (ey * bl - dy * cl) * d;
+            ccy[t] = ay + (dx * cl - ex * bl) * d;
+        }
+    }
+
+    // 3. Build inEdge with the d3-delaunay "inedges" pattern so a hull fan
+    //    starts at the hull: a hull-incoming edge (halfedges[e] == -1) always
+    //    wins, otherwise the first edge seen wins. Vertices skipped by the
+    //    triangulator's EPSILON dedup keep inEdge -1.
+    const inEdge = slot.inEdge;
+    inEdge.fill(-1, 0, m);
+    const trianglesLen = triCount * 3;
+    for (let e = 0; e < trianglesLen; e++) {
+        const ne = (e % 3 === 2) ? e - 2 : e + 1; // nextHalfedge(e)
+        const p = triangles[ne];
+        if (halfedges[e] === -1 || inEdge[p] === -1) inEdge[p] = e;
+    }
+}
+
+/**
+ * Create a pooled cell-index FACTORY sized for up to `maxPoints` points.
+ *
+ * The returned function is the CellIndexFactory lite-charts injects:
+ * `(pxs, pys, n) -> CellIndex`. It mirrors {@link createSpatialIndex} exactly --
+ * pooled factory-factory, SoA input, NaN compaction, ORIGINAL indices,
+ * generation-stamped facades -- but instead of a k-NN grid it builds the
+ * Delaunay mesh, precomputes every circumcenter, and answers `cell(i, ...)` by
+ * walking the half-edges around site i and CLIPPING the resulting Voronoi
+ * polygon to the caller's axis-aligned bbox.
+ *
+ * Memory model: a build allocates exactly one small facade (~48 B, young-gen,
+ * minor-GC-collectible); the mesh arena, scratch, circumcenter arrays and clip
+ * buffers are all pooled -- 0 B beyond the facade -- and `cell()` is 0 B/query.
+ * One factory serves many concurrent live handles; a new slot is allocated only
+ * at a new concurrent high-water mark.
+ *
+ * SIZING RULE (documented so callers can size outXY): a bbox-clipped Voronoi
+ * cell of an INTERIOR site has at most (degree + 4) vertices, and of a HULL site
+ * at most (degree + 5). A caller-owned buffer of 2 * 64 floats (64 vertices)
+ * covers every non-adversarial cloud; if a clipped cell needs more, `cell()`
+ * THROWS rather than truncating -- the loud escape.
+ *
+ * @example
+ * // In a lite-charts scatter config (cells is all-or-nothing opt-in):
+ * const chart = createScatterChart({
+ *   data,
+ *   cells: { index: createCellIndex(20_000), colorKey: 'zone' },
+ * });
+ * // The chart calls factory(pxs, pys, n) at extract time, disposes the old
+ * // index first, and per frame walks each visible cell(i, ...) at 0 B.
+ *
+ * @param {number} maxPoints hard upper bound on `n` per build. Must be a
+ *   non-negative integer.
+ * @returns {(pxs: ArrayLike<number>, pys: ArrayLike<number>, n: number) => object}
+ *   the CellIndexFactory.
+ * @throws {Error} if `maxPoints` is not a non-negative integer.
+ */
+export const createCellIndex = (maxPoints) => {
+    if (!Number.isInteger(maxPoints) || maxPoints < 0) {
+        throw new Error(`lite-delaunay: maxPoints must be a non-negative integer, got ${maxPoints}`);
+    }
+
+    // Pool bookkeeping, identical in shape to createSpatialIndex.
+    const pool = { slots: [], freeStack: [], freeCount: 0 };
+
+    return function buildCellIndex(pxs, pys, n) {
+        // Fail closed at build time -- all guards live here, off the query path.
+        if (!Number.isInteger(n) || n < 0) {
+            throw new Error(`lite-delaunay: n must be a non-negative integer, got ${n}`);
+        }
+        if (n > maxPoints) {
+            throw new Error(`lite-delaunay: n (${n}) exceeds cell index max (${maxPoints})`);
+        }
+        if (pxs == null || pys == null) {
+            throw new Error("lite-delaunay: pxs and pys are required");
+        }
+        if (pxs.length < n || pys.length < n) {
+            throw new Error(`lite-delaunay: pxs/pys shorter than n (${n})`);
+        }
+
+        // Acquire a free slot, or grow the pool at a new high-water mark.
+        let idx;
+        if (pool.freeCount > 0) {
+            idx = pool.freeStack[--pool.freeCount];
+        } else {
+            idx = pool.slots.length;
+            pool.slots[idx] = _createCellSlot(maxPoints, pool, idx);
+        }
+        const slot = pool.slots[idx];
+
+        _buildCellSlot(slot, pxs, pys, n);
+        // New generation for this build; any facade from a prior build of this
+        // slot is now stale and will throw.
+        slot.gen++;
+        const facade = Object.create(CELL_FACADE_PROTO);
         facade._slot = slot;
         facade._gen = slot.gen;
         return facade;

@@ -76,28 +76,44 @@ one-line wire-up in a chart config.
   the exported contract must not change either way.
 - Gate: contract-shape test mirroring the charts interface; a
   brute-force-vs-index equivalence sweep (random + clustered + collinear +
-  coincident inputs); 0 B/query and 0 B/rebuild under the torture harness;
-  coherent-query walk length bounded.
+  coincident inputs); 0 B/query and pooled rebuilds (~48 B facade per build --
+  what shipped; "stale use throws" rules out 0 B/rebuild) under the torture
+  harness; coherent-query walk length bounded.
 
-## v1.2.0 -- Voronoi dual (unlocks: Voronoi/cell-tessellation charts, exact hover regions)
+## v1.2.0 -- Voronoi cells (SHIPPED: `createCellIndex`)
 
-The llms.txt already hands consumers a circumcenter recipe and says "you
-write that step". Promote it into the library, zero-GC:
+Shaped by a real consumer: LiteCharts/briefs/voronoi-cells.md ("The consumer
+contract") REPLACED the earlier sketch below. Rather than expose raw
+circumcenters + an open/closed cell flag, v1.2.0 ships a single charts-facing
+factory that does the whole job and hands back a polygon that is always safe to
+draw:
 
-- `circumcenters(coords, outCx, outCy)` -> fills caller-owned per-triangle
-  arrays (the llms.txt snippet, hardened: near-degenerate d ~ 0 fails closed
-  to the triangle centroid rather than emitting Infinity).
-- `voronoiCell(p, outVerts) -> vertexCount` -- walk the half-edges around
-  point p, emit the circumcenter polygon into a caller-owned buffer; hull
-  points return a flagged open cell (count < 0 or an explicit isOpen out
-  param -- planner's call, but the open/closed distinction must be
-  impossible to miss, fail closed).
-- What it enables in lite-charts: a Voronoi-tessellation chart type
+- `export const createCellIndex = (maxPoints) => (pxs, pys, n) => cellIndex` --
+  a pooled factory-factory mirroring `createSpatialIndex` exactly (SoA input,
+  NaN compaction, ORIGINAL indices, generation-stamped ~48 B facade, one factory
+  / many concurrent handles). The build triangulates ONCE and precomputes every
+  circumcenter.
+- `cell(i, bx0, by0, bx1, by1, outXY) -> vertexCount` -- walk the half-edges
+  around site `i` and write its Voronoi polygon, CLIPPED to the axis-aligned
+  bbox (zero-allocation Sutherland-Hodgman), into the caller-owned interleaved
+  buffer. 0 B/query.
+- Bbox clipping lives INSIDE the library (d3-delaunay's `voronoi(bounds)`
+  precedent): every returned cell is finite, convex, closed and inside-or-on the
+  bbox, or absent (returns 0). There is NO open-cell flag -- hull cells are
+  closed by a provably-outside far-fan and clipped, so the caller never sees an
+  unbounded ray. This is the correction to the old sketch's "flagged open cell".
+- Near-degenerate circumcenters (d ~ 0) fail closed to the triangle centroid --
+  no Infinity vertex, as the sketch already required.
+- SIZING correction: a bbox-clipped cell of an interior site has at most
+  degree + 4 vertices; a HULL site at most degree + 5 (the far-fan adds the
+  extra corner). The brief's "degree + 4" bound is the interior case; hull cells
+  need the +5. A 64-vertex caller buffer covers every non-adversarial cloud;
+  overflow THROWS rather than truncates.
+- What it enables in lite-charts: the scatter `cells` tessellation layer
   (cell-shaded scatter -- every reading owns a colored region, the classic
-  station-map/coverage view), and "fat" hover targets -- the Voronoi cell IS
-  the exact nearest-neighbor hit region, so hover on a sparse scatter stops
-  requiring pixel-perfect aim. Also the honest basis for a v1.1.x
-  findNearest upgrade (k=1 exactness proof).
+  station-map/coverage view) plus a free hover-cell highlight. "Fat" hover
+  itself turned out to need NOTHING from delaunay (it is a charts-side
+  tolerance policy over the existing k=1 spatial query -- see the brief's D1).
 
 ## v1.3.0 -- mesh interpolation (unlocks: contour + field charts from scattered data)
 
