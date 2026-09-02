@@ -1,0 +1,80 @@
+{
+  "name": "@zakkster/lite-delaunay",
+  "version": "1.1.0",
+  "description": "Zero-GC 2D Delaunay triangulation for per-frame use. Pre-allocated Int32Array arena, sweepline algorithm (Mapbox-style), half-edge mesh output. ~500 LOC, no dependencies, no per-frame allocations.",
+  "type": "module",
+  "main": "./Delaunay.js",
+  "module": "./Delaunay.js",
+  "types": "./Delaunay.d.ts",
+  "exports": {
+    ".": {
+      "types": "./Delaunay.d.ts",
+      "node": "./Delaunay.js",
+      "import": "./Delaunay.js",
+      "default": "./Delaunay.js"
+    }
+  },
+  "files": [
+    "Delaunay.js",
+    "Delaunay.d.ts",
+    "README.md",
+    "llms.txt",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --expose-gc test/edge-cases.test.js && node --expose-gc --test test/SpatialIndex.test.js",
+    "torture": "node --expose-gc test/torture.mjs",
+    "bench": "node --expose-gc bench/bench.js",
+    "bench:compare": "node --expose-gc bench/bench-vs-delaunator.js",
+    "verify": "npm run test && npm run torture && npm run bench",
+    "bundle-check": "npx esbuild Delaunay.js --bundle --format=esm --outfile=test-bundle.js"
+  },
+  "keywords": [
+    "delaunay",
+    "triangulation",
+    "voronoi",
+    "mesh",
+    "mesh-generation",
+    "half-edge",
+    "halfedge",
+    "computational-geometry",
+    "geometry",
+    "sweepline",
+    "delaunator",
+    "zero-gc",
+    "zero-allocation",
+    "pre-allocated",
+    "arena",
+    "typed-array",
+    "performance",
+    "data-oriented",
+    "real-time",
+    "gamedev",
+    "simulation",
+    "webgl",
+    "canvas",
+    "esm",
+    "typescript"
+  ],
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "homepage": "https://github.com/PeshoVurtoleta/lite-delaunay#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-delaunay.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-delaunay/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
+  "sideEffects": false,
+  "devDependencies": {
+    "@zakkster/lite-gc-profiler": "^1.16.0",
+    "@zakkster/lite-leak": "^1.10.0",
+    "@zakkster/lite-poisson-disc": "^1.0.0",
+    "delaunator": "^5.0.0"
+  }
+}

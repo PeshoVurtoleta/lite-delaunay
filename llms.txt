@@ -1,0 +1,240 @@
+# @zakkster/lite-delaunay
+
+Version: 1.1.0
+
+> Zero-GC 2D Delaunay triangulation. Pre-allocated arena, sweepline algorithm,
+> half-edge mesh output. Built for per-frame use in games and simulations
+> where `new Delaunator(coords)` every frame would cause GC stutter.
+> As of 1.1.0 it also ships a charts-facing k-NN spatial index
+> (`createSpatialIndex`) that any consumer can inject as a `SpatialIndexFactory`.
+
+## Surface area
+
+ONE class, ONE method, FOUR public properties. That's the entire API.
+
+```ts
+class DelaunayTriangulator {
+  constructor(maxPoints: number);                    // allocate the arena once
+  triangulate(coords, pointCount: number): number;   // run; returns triangleCount
+
+  readonly maxPoints: number;
+  readonly triangles: Int32Array;     // vertex indices, 3 per triangle, valid up to trianglesLen
+  readonly halfedges: Int32Array;     // twin half-edge indices (or -1 on the hull), parallel
+  readonly trianglesLen: number;      // valid-length cursor; equals triangleCount * 3
+}
+```
+
+`coords` is flat interleaved `[x0, y0, x1, y1, ...]`. Float32Array, Float64Array,
+and plain number[] are all accepted (typed access is faster).
+
+## Canonical usage pattern
+
+```js
+import { DelaunayTriangulator } from "@zakkster/lite-delaunay";
+
+// Once: pick the largest input you'll ever see.
+const tri = new DelaunayTriangulator(10_000);
+
+// Per frame / per call: zero allocations.
+const count = tri.triangulate(coords, n);
+for (let k = 0; k < count; k++) {
+  const a = tri.triangles[k * 3];
+  const b = tri.triangles[k * 3 + 1];
+  const c = tri.triangles[k * 3 + 2];
+  // (coords[a*2], coords[a*2+1]) is the (x,y) of vertex a
+}
+```
+
+## Half-edge mesh
+
+`halfedges[i]` is the index of the twin half-edge across the shared edge, or
+-1 if the edge is on the convex hull. Triangle for half-edge `i` is
+`Math.floor(i / 3)`. Next/prev half-edge in the same triangle:
+
+```js
+const next = (i % 3 === 2) ? i - 2 : i + 1;
+const prev = (i % 3 === 0) ? i + 2 : i - 1;
+```
+
+Endpoints of half-edge `i`: `triangles[i]` (start) and `triangles[next]` (end).
+
+For every `e` where `halfedges[e] !== -1`: `halfedges[halfedges[e]] === e`.
+
+## Winding
+
+Triangles are output in **counter-clockwise winding in math coordinates**
+(Y-up). In screen-space (Y-down) this looks clockwise. Same convention as
+Mapbox Delaunator.
+
+## Degenerate inputs
+
+Return 0 (do NOT throw, do NOT hang):
+- pointCount < 3
+- all points coincident
+- all points fully collinear
+
+`trianglesLen` is reset to 0 on every call, including degenerate ones -- so
+stale state never leaks through.
+
+## Throws
+
+- `new DelaunayTriangulator(x)` with x not a non-negative integer
+- `tri.triangulate(coords, n)` with `n > maxPoints`
+
+## What it is NOT
+
+- Not a Voronoi library -- the dual graph is easy to extract from the half-edge
+  mesh, but you write that step.
+- Not robust against ill-conditioned inputs -- uses fast non-robust f64
+  predicates, same as Mapbox Delaunator.
+- Not auto-growing -- the arena is fixed at construction. Pick a tight bound.
+
+## Algorithm
+
+Sweepline Delaunay (Liu & Snoeyink 2005), ported from Mapbox Delaunator onto
+a static Int32Array arena. O(n log n) average, O(n^2) worst-case on adversarial
+cocircular inputs.
+
+## Memory footprint
+
+Approximately **68 × maxPoints + 16 KB**.
+- maxPoints = 1 000     -> ~80 KB
+- maxPoints = 10 000    -> ~700 KB
+- maxPoints = 100 000   -> ~7 MB
+
+## Performance (Node 22, Apple-Silicon-class)
+
+| n       | lite-delaunay ms | Mapbox Delaunator ms |
+|--------:|-----------------:|---------------------:|
+| 1 000   | 0.55             | 0.54                 |
+| 10 000  | 6.82             | 7.04                 |
+| 100 000 | 86.8             | 93.6                 |
+
+At parity with the reference at typical sizes (1k-10k); ~5-10% ahead at
+very large N (50k+); ~1.4× ahead at small N where Delaunator's per-call
+allocation dominates. The win is not raw throughput -- it is zero per-call
+allocation. Heap delta < 1 KB across 10 000 repeated triangulate() calls
+under --expose-gc. Delaunator allocates ~50 KB at small N (output arrays)
+which dominates its cost when work is microseconds; that overhead amortizes
+away as N grows.
+
+## Common follow-up: Voronoi from the dual
+
+```js
+// Per-triangle circumcenter scratch -- also allocate once.
+const cxArr = new Float32Array(tri.maxTriangles);
+const cyArr = new Float32Array(tri.maxTriangles);
+
+// After triangulate():
+for (let k = 0; k < count; k++) {
+  const a = tri.triangles[k * 3], b = tri.triangles[k * 3 + 1], c = tri.triangles[k * 3 + 2];
+  const ax = coords[a*2], ay = coords[a*2+1];
+  const bx = coords[b*2], by = coords[b*2+1];
+  const cx_ = coords[c*2], cy_ = coords[c*2+1];
+  const dx = bx - ax, dy = by - ay, ex = cx_ - ax, ey = cy_ - ay;
+  const bl = dx*dx + dy*dy, cl = ex*ex + ey*ey;
+  const d  = 0.5 / (dx*ey - dy*ex);
+  cxArr[k] = ax + (ey*bl - dy*cl) * d;
+  cyArr[k] = ay + (dx*cl - ex*bl) * d;
+}
+// Voronoi cell of point p = polygon of circumcenters of triangles incident to p,
+// walked via the half-edges around p.
+```
+
+## Spatial index (v1.1.0)
+
+A second export, `createSpatialIndex`, is the charts-facing capability: a pooled,
+zero-allocation k-nearest-neighbour query over a fixed set of pixel coordinates.
+It is what `@zakkster/lite-charts` injects to hit-test dense bubble/scatter point
+clouds. Implementation is a uniform grid; `triangulate()` is NOT involved.
+
+```ts
+const createSpatialIndex: (maxPoints: number) => SpatialIndexFactory;
+
+type SpatialIndexFactory = (pxs, pys, n) => SpatialIndex;
+
+interface SpatialIndex {
+  // up to k nearest to (qx, qy) by squared pixel distance, filtered to
+  // d <= maxDistSq. Writes ORIGINAL indices + SQUARED distances into the
+  // caller-owned outIndices/outDistSq (length >= k), nearest-first. Returns
+  // the count written (0..k). k is clamped to 8. Zero allocation.
+  findNearest(qx, qy, k, maxDistSq, outIndices, outDistSq): number;
+  dispose(): void;
+}
+```
+
+### Canonical usage: wiring into a lite-charts config
+
+```js
+import { createSpatialIndex } from "@zakkster/lite-delaunay";
+
+const chart = createBubbleChart({
+  // one factory; the chart builds one index per series and disposes them
+  // as data changes. maxPoints must be >= the largest series point count.
+  spatialIndexFactory: createSpatialIndex(20_000),
+  // ...
+});
+```
+
+The chart calls `factory(pxs, pys, n)` at extract time (rebuild on data change),
+disposes the previous index first, and per hover calls `findNearest`, then
+post-filters the k results by disc containment (`hitDistSq[j] <= r*r`) and
+smallest-radius tie-break. Containment is INCLUSIVE on both sides, so the index
+never hides a hit the linear scan would have found.
+
+### NaN semantics
+
+`pxs` / `pys` are `Float32Array`s that legitimately contain `NaN` (log-scale
+projections, missing data). Build compacts ONLY finite points, so `findNearest`
+can never return a NaN point. A non-finite query `(qx, qy)` returns `0` -- fail
+closed, never a guess.
+
+### Pool / dispose semantics
+
+One factory serves MANY concurrent live handles (a multi-series chart builds one
+per series, disposes them independently, rebuilds lazily). Each build acquires a
+free pooled slot; each `dispose()` returns it. A new slot is allocated only at a
+new concurrent high-water mark. A build allocates exactly one small handle
+facade (~48 B, young-gen, minor-GC-collectible); all arenas, grids and scratch
+are pooled -- 0 B beyond the facade -- and `findNearest` is 0 B/query. Never
+0 B/rebuild.
+
+The facade carries a generation stamp over its pooled slot: `findNearest` and
+`dispose` on a disposed handle THROW; double-dispose throws; and a STALE handle
+whose slot was rebuilt for another series THROWS rather than silently returning
+the new build's points. (With object-reused handles a stale ref is
+byte-indistinguishable from a fresh one, so fail-closed forces the fresh facade
+per build -- the trade is one ~48 B object, never a wrong answer.)
+
+Degenerate input (all-coincident / all-collinear) is answered correctly by the
+grid (it degrades to a 1-cell linear scan) -- never wrong, maybe slow.
+
+### Memory
+
+Per live slot: approximately `24 * maxPoints` bytes plus the grid-cell arrays
+(`~ maxPoints` cells). Total peak scales with the concurrent high-water mark of
+live handles, not the number of rebuilds. Each build additionally allocates one
+~48 B facade (minor-GC-collectible); the torture gate proves 2000 rebuild cycles
+cause zero MAJOR GC.
+
+### Throws
+
+- `createSpatialIndex(x)` with x not a non-negative integer
+- `factory(pxs, pys, n)` with `n > maxPoints`, `n` not a non-negative integer,
+  missing `pxs`/`pys`, or arrays shorter than `n`
+- `findNearest` / `dispose` on a disposed handle; double-dispose
+
+## Anti-patterns to avoid
+
+- **Do not allocate the triangulator per frame.** That defeats the entire
+  point. Construct once at init, reuse forever.
+- **Do not read `triangles` past `trianglesLen`.** Indices past that point are
+  leftover bytes from previous calls.
+- **Do not assume `triangles.length === trianglesLen`.** `triangles.length` is
+  the arena capacity (3 × maxTriangles); `trianglesLen` is the valid prefix.
+- **Do not pad coords with sentinels** to handle "fewer points this frame".
+  Just pass the actual `pointCount`; the arena handles partial usage fine.
+
+## License
+
+MIT
