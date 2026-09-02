@@ -36,7 +36,7 @@
  * are bumped in the same commit or not at all (packaging law).
  * @type {string}
  */
-export const VERSION = "1.1.0";
+export const VERSION = "1.1.1";
 
 // IEEE 754 double machine-epsilon. Used for the near-duplicate-point skip
 // in the advancing-front loop (matches Mapbox Delaunator's tolerance).
@@ -965,7 +965,7 @@ function _buildSpatialSlot(slot, pxs, pys, n) {
  * @example
  * // In a lite-charts config:
  * const chart = createBubbleChart({
- *   spatialIndexFactory: createSpatialIndex(20_000),
+ *   spatialIndex: createSpatialIndex(20_000),
  *   // ...
  * });
  *

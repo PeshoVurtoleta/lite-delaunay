@@ -317,7 +317,7 @@ const chart = createBubbleChart({
   // One factory for the whole chart. It builds one index per series and
   // disposes them independently as data changes. maxPoints >= your largest
   // series point count.
-  spatialIndexFactory: createSpatialIndex(20_000),
+  spatialIndex: createSpatialIndex(20_000),
   // ...
 });
 ```

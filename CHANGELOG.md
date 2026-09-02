@@ -3,6 +3,23 @@
 All notable changes to `@zakkster/lite-delaunay` are documented here. The format
 is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [1.1.1] - 2026-09-02
+
+### Fixed
+
+- Docs: the lite-charts wiring example used the config key
+  `spatialIndexFactory:`; the real key is `spatialIndex:`. Fixed in README.md,
+  llms.txt and the `createSpatialIndex` JSDoc example. Found by the lite-charts
+  integration session while wiring the live demo. No code change.
+
+### Changed
+
+- The root-level correctness probe `Delaunay.test.js` (halfedge twin pairing +
+  the Delaunay in-circle property + exact triangle counts on known inputs) is
+  ported to `node:test` as `test/DelaunayProperty.test.js`, ASCII-normalized,
+  and wired into `npm test` (7 tests). The root file is removed. Repo-only:
+  the probe was never part of the published tarball.
+
 ## [1.1.0] - 2026-09-02
 
 ### Added

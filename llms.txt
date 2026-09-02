@@ -1,6 +1,6 @@
 # @zakkster/lite-delaunay
 
-Version: 1.1.0
+Version: 1.1.1
 
 > Zero-GC 2D Delaunay triangulation. Pre-allocated arena, sweepline algorithm,
 > half-edge mesh output. Built for per-frame use in games and simulations
@@ -171,7 +171,7 @@ import { createSpatialIndex } from "@zakkster/lite-delaunay";
 const chart = createBubbleChart({
   // one factory; the chart builds one index per series and disposes them
   // as data changes. maxPoints must be >= the largest series point count.
-  spatialIndexFactory: createSpatialIndex(20_000),
+  spatialIndex: createSpatialIndex(20_000),
   // ...
 });
 ```

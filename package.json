@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-delaunay",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Zero-GC 2D Delaunay triangulation for per-frame use. Pre-allocated Int32Array arena, sweepline algorithm (Mapbox-style), half-edge mesh output. ~500 LOC, no dependencies, no per-frame allocations.",
   "type": "module",
   "main": "./Delaunay.js",
@@ -26,7 +26,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node --expose-gc test/edge-cases.test.js && node --expose-gc --test test/SpatialIndex.test.js",
+    "test": "node --expose-gc test/edge-cases.test.js && node --expose-gc --test test/SpatialIndex.test.js test/DelaunayProperty.test.js",
     "torture": "node --expose-gc test/torture.mjs",
     "bench": "node --expose-gc bench/bench.js",
     "bench:compare": "node --expose-gc bench/bench-vs-delaunator.js",
