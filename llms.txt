@@ -1,6 +1,6 @@
 # @zakkster/lite-delaunay
 
-Version: 1.2.0
+Version: 1.3.0
 
 > Zero-GC 2D Delaunay triangulation. Pre-allocated arena, sweepline algorithm,
 > half-edge mesh output. Built for per-frame use in games and simulations
@@ -322,6 +322,118 @@ rebuilt slot THROWS rather than returning the new build's cells.
 - `cell(i, ...)` with `i` not an integer in `[0, n)`, a non-finite or
   non-strictly-ordered bbox, an `outXY` too small for the clipped cell, or on a
   disposed handle; `dispose` double-dispose
+
+## Field index (v1.3.0)
+
+A fourth export, `createFieldIndex`, is the scattered-data interpolation
+capability: a pooled, zero-allocation query that triangulates the Delaunay mesh
+ONCE and then locates points and interpolates scalar fields against it. Unlike
+`createCellIndex` (a Voronoi-cell surface), this walks the mesh to answer
+point-location (`locate`) and barycentric-interpolation (`interpolate`,
+`sampleField`) queries. ONE mesh serves MANY scalar fields: `pxs`/`pys` fix the
+geometry at build time, and every query takes the `zs` values per-call (indexed
+by ORIGINAL point index), so a caller interpolates temperature, then pressure,
+then elevation over the same cloud without rebuilding. The core is a remembering
+visibility walk that starts from the last hit triangle, so a coherent query
+stream (a raster scan, a dragged cursor) costs O(1) amortised steps.
+
+```ts
+const createFieldIndex: (maxPoints: number) => FieldIndexFactory;
+
+type FieldIndexFactory = (pxs, pys, n) => FieldIndex;  // Float32Array, NaN legal
+
+interface FieldIndex {
+  // Locate the COMPACTED-MESH triangle containing (qx, qy). Returns a triangle
+  // id in [0, triangleCount), or -1 for a non-finite query, a degenerate build,
+  // or a point outside the convex hull. z-agnostic. 0 B/call.
+  locate(qx, qy): number;
+  // Write the 3 barycentric weights of (qx, qy) in triangle t into outW3 (ALWAYS
+  // all three). Returns true iff q is inside-or-on t (all weights >= -1e-9). A
+  // near-zero-area triangle writes NaN,NaN,NaN and returns false.
+  barycentric(t, qx, qy, outW3): boolean;
+  // Write triangle t's 3 ORIGINAL point indices into outI3. Reserves per-triangle
+  // site access for future contour / TIN work.
+  triangleVertices(t, outI3): void;
+  // Triangle count of the built mesh (0 on a degenerate build).
+  triangleCount(): number;
+  // Interpolate zs at (qx, qy): locate + barycentric + weighted sum of zs at the
+  // 3 ORIGINAL indices. NaN outside the hull / on a degenerate build / area-guard
+  // fail; a NaN-z corner propagates arithmetically. 0 B/call.
+  interpolate(zs, qx, qy): number;
+  // Rasterize zs onto a gridW x gridH grid over the bbox, writing outGrid; returns
+  // the count of FINITE cells written. See the grid contract below. 0 B/call.
+  sampleField(zs, gridW, gridH, bx0, by0, bx1, by1, outGrid): number;
+  dispose(): void;
+}
+```
+
+### Grid contract
+
+`sampleField` writes row-major, `index = row*gridW + col`, with col 0 at `bx0`
+(xMin) and row 0 at `by0` (yMin) -- MATHEMATICAL +y-up orientation, deliberately
+NOT screen convention. Cell-CENTER sampling: `x_j = bx0 + (j + 0.5) * (bx1 - bx0)
+/ gridW`, `y_i = by0 + (i + 0.5) * (by1 - by0) / gridH`. Cells outside the hull
+get `NaN`; a degenerate build fills the whole `gridW*gridH` prefix with `NaN` and
+returns `0`. A pixel-space consumer flips rows itself and derives any present-mask
+itself, on its own cold path.
+
+### Canonical usage: reserved lite-charts wiring
+
+```js
+import { createFieldIndex } from "@zakkster/lite-delaunay";
+
+const chart = createScatterChart({
+  data,
+  // RESERVED future wiring (a heatmap / contour layer). The outer `field:` key
+  // is reserved and NOT YET CONSUMED -- charts will wire it via a future brief.
+  field: { index: createFieldIndex(20_000) },
+});
+```
+
+### Fail-closed list
+
+- A non-finite query `(qx, qy)` or a point outside the convex hull: `locate`
+  returns `-1`, `interpolate` returns `NaN`, `sampleField` writes `NaN` for that
+  cell.
+- Degenerate build (fewer than 3 finite points, or all-collinear/coincident so
+  the triangulation is empty): `locate` returns `-1`, `triangleCount` returns
+  `0`, `sampleField` NaN-fills the grid prefix and returns `0`.
+- A near-zero-area triangle (relative area guard): `barycentric` writes
+  `NaN,NaN,NaN` and returns `false`; `interpolate`/`sampleField` yield `NaN`.
+- A NaN z-value is confined to its incident triangles -- it propagates
+  arithmetically into exactly those cells, with no NaN branch on the hot path.
+- The walk provably terminates on a Delaunay mesh; a step budget covers
+  f64-degenerate cycling by falling back to an O(T) linear scan -- never wrong,
+  maybe slow.
+
+### Pool / dispose semantics
+
+Identical to `createCellIndex`: one factory serves many concurrent live handles,
+each build acquires a pooled slot and each `dispose()` returns it, a new slot is
+allocated only at a new concurrent high-water mark, and a build allocates exactly
+one small handle facade (~48 B, minor-GC-collectible) -- 0 B beyond it, and every
+query is 0 B. The facade carries a generation stamp: using or double-disposing a
+disposed handle THROWS, and a stale handle onto a rebuilt slot THROWS.
+
+### Memory
+
+Per-slot memory is `~100*maxPoints` bytes + 16 KB (the mesh arena, f64 scratch,
+the orig2v/vert2orig maps and the z-gather buffer -- no circumcenters, so lighter
+than the cell slot).
+
+### Throws
+
+- `createFieldIndex(x)` with x not a non-negative integer
+- `factory(pxs, pys, n)` with `n > maxPoints`, `n` not a non-negative integer,
+  missing `pxs`/`pys`, or arrays shorter than `n`
+- any method on a disposed or stale handle; `dispose` double-dispose
+- `barycentric(t, ...)` / `triangleVertices(t, ...)` with `t` not an integer in
+  `[0, triangleCount)`, or the out-array too short
+- `interpolate(zs, ...)` with `zs` missing or shorter than `n`
+- `sampleField(zs, ...)` with `zs` missing/short, `gridW`/`gridH` not positive
+  integers, `outGrid` the wrong type or too short, or the bbox non-finite or not
+  strictly ordered (`bx0 < bx1`, `by0 < by1`)
+- Out-of-range / NaN queries are VALUES (`-1` / `NaN`), never throws.
 
 ## Anti-patterns to avoid
 

@@ -307,3 +307,146 @@ export type CellIndexFactory = (
  * @throws if `maxPoints` is not a non-negative integer.
  */
 export function createCellIndex(maxPoints: number): CellIndexFactory;
+
+/**
+ * A pre-built, allocation-free point-location and scalar-field interpolation
+ * query over a fixed set of SoA coordinates. Produced by a
+ * {@link FieldIndexFactory}. Unlike {@link CellIndex} (a Voronoi-cell surface),
+ * this triangulates the Delaunay mesh ONCE and walks it to answer queries. ONE
+ * mesh serves MANY scalar fields: geometry is fixed at build, and each query
+ * takes its `zs` per-call (indexed by ORIGINAL point index).
+ */
+export interface FieldIndex {
+    /**
+     * Locate the COMPACTED-MESH triangle containing `(qx, qy)`. Returns a
+     * triangle id in `[0, triangleCount())`, or `-1` for a non-finite query, a
+     * degenerate build, or a point outside the convex hull. z-agnostic. Updates
+     * the walk cursor on a hit for coherence. Zero allocation.
+     *
+     * @throws if the handle is disposed or stale.
+     */
+    locate(qx: number, qy: number): number;
+
+    /**
+     * Write the three barycentric weights of `(qx, qy)` in triangle `t` into
+     * `outW3` (ALWAYS all three), and return `true` iff `q` is inside-or-on `t`
+     * (every weight `>= -1e-9`). A near-zero-area triangle writes `NaN,NaN,NaN`
+     * and returns `false`. Zero allocation.
+     *
+     * @param t compacted-mesh triangle id in `[0, triangleCount())`.
+     * @param outW3 caller-owned output, length `>= 3`.
+     * @throws if the handle is disposed/stale, `t` is not an integer in range,
+     *   or `outW3` is too short.
+     */
+    barycentric(
+        t: number,
+        qx: number,
+        qy: number,
+        outW3: Float32Array | Float64Array | number[]
+    ): boolean;
+
+    /**
+     * Write triangle `t`'s three ORIGINAL point indices (as passed to the
+     * factory) into `outI3`. Reserves per-triangle site access for future
+     * contour / TIN work. Zero allocation.
+     *
+     * @param t compacted-mesh triangle id in `[0, triangleCount())`.
+     * @param outI3 caller-owned output, length `>= 3`.
+     * @throws if the handle is disposed/stale, `t` is not an integer in range,
+     *   or `outI3` is too short.
+     */
+    triangleVertices(t: number, outI3: Int32Array | number[]): void;
+
+    /**
+     * Number of triangles in the built mesh. `0` on a degenerate build.
+     *
+     * @throws if the handle is disposed or stale.
+     */
+    triangleCount(): number;
+
+    /**
+     * Interpolate the scalar field `zs` at `(qx, qy)`: locate the containing
+     * triangle, compute barycentric weights, return the weighted sum of `zs` at
+     * the triangle's three ORIGINAL vertex indices. Returns `NaN` when the query
+     * is non-finite, the build is degenerate, the point is outside the hull, or
+     * the area guard fails; a `NaN`-z corner propagates arithmetically. `zs` is
+     * indexed by ORIGINAL point index. Zero allocation.
+     *
+     * @param zs scalar values, length `>= n`.
+     * @throws if the handle is disposed/stale, or `zs` is missing or shorter
+     *   than `n`.
+     */
+    interpolate(
+        zs: Float32Array | Float64Array | number[],
+        qx: number,
+        qy: number
+    ): number;
+
+    /**
+     * Rasterize the scalar field `zs` onto a `gridW x gridH` regular grid over
+     * the bbox, writing into `outGrid`, and return the count of FINITE cells
+     * written.
+     *
+     * GRID CONTRACT: row-major, `index = row*gridW + col`; col 0 at `bx0`
+     * (xMin), row 0 at `by0` (yMin) -- MATHEMATICAL +y-up orientation,
+     * deliberately NOT screen convention (a pixel-space consumer flips rows
+     * itself). Cell-CENTER sampling. Cells outside the hull get `NaN`; a
+     * degenerate build fills the `gridW*gridH` prefix with `NaN` and returns
+     * `0`. Zero allocation.
+     *
+     * @param zs scalar values, length `>= n`.
+     * @param outGrid caller-owned output, length `>= gridW*gridH`.
+     * @throws if the handle is disposed/stale; `zs` is missing/short;
+     *   `gridW`/`gridH` are not positive integers; `outGrid` is the wrong type
+     *   or too short; or the bbox is non-finite or not strictly ordered
+     *   (`bx0 < bx1`, `by0 < by1`).
+     */
+    sampleField(
+        zs: Float32Array | Float64Array | number[],
+        gridW: number,
+        gridH: number,
+        bx0: number,
+        by0: number,
+        bx1: number,
+        by1: number,
+        outGrid: Float32Array | Float64Array
+    ): number;
+
+    /**
+     * Release this handle back to its factory pool. The backing mesh arena lives
+     * as long as the factory. Using or double-disposing a disposed handle throws.
+     */
+    dispose(): void;
+}
+
+/**
+ * Builds a {@link FieldIndex} over the SoA coordinates `pxs` / `pys` (the first
+ * `n` entries of each; `NaN`/`Infinity` legal, compacted out at build). `n` must
+ * be `<= maxPoints` (throws otherwise). A build allocates one small handle facade
+ * (~48 B, minor-GC-collectible); the mesh arena, scratch, index maps and z-gather
+ * buffer are pooled -- 0 B beyond the facade.
+ */
+export type FieldIndexFactory = (
+    pxs: ArrayLike<number>,
+    pys: ArrayLike<number>,
+    n: number
+) => FieldIndex;
+
+/**
+ * Create a pooled field-index factory sized for up to `maxPoints` points.
+ *
+ * Mirrors {@link createCellIndex} exactly (pooled factory-factory, SoA input,
+ * NaN compaction, ORIGINAL indices, generation-stamped facades) but, instead of
+ * a Voronoi-cell surface, triangulates the mesh ONCE and answers point-location
+ * and barycentric-interpolation queries with a remembering visibility walk. ONE
+ * mesh serves MANY scalar fields: geometry is fixed at build, and each query
+ * takes its `zs` per-call (indexed by ORIGINAL point index). A build allocates
+ * one small handle facade (~48 B); everything else is pooled and every query is
+ * 0 B. A new slot is allocated only at a new concurrent high-water mark. Per-slot
+ * memory is `~100*maxPoints` bytes + 16 KB (no circumcenters).
+ *
+ * @param maxPoints hard upper bound on `n` per build. Must be a non-negative
+ *   integer.
+ * @throws if `maxPoints` is not a non-negative integer.
+ */
+export function createFieldIndex(maxPoints: number): FieldIndexFactory;

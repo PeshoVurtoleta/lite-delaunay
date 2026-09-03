@@ -41,6 +41,7 @@ Same sweepline algorithm as [Mapbox Delaunator](https://github.com/mapbox/delaun
 - [Use case: Voronoi from the dual graph](#use-case-voronoi-from-the-dual-graph)
 - [Spatial index: hit-testing dense point clouds](#spatial-index-hit-testing-dense-point-clouds)
 - [Cell index: bbox-clipped Voronoi cells](#cell-index-bbox-clipped-voronoi-cells)
+- [Field index: scattered data to regular grids](#field-index-scattered-data-to-regular-grids)
 - [API reference](#api-reference)
 - [Benchmarks](#benchmarks)
 - [Testing](#testing)
@@ -448,6 +449,37 @@ Near-degenerate circumcenters (denominator ~ 0) fail closed to the triangle cent
 ### Zero-GC design, including the pool
 
 Pooling, the ~48 B per-build facade, and generation-stamped fail-closed handles are **identical to the spatial index** above: one factory serves many concurrent live handles, a build acquires a pooled slot and a dispose returns it, a new slot is allocated only at a new concurrent high-water mark, and `cell()` is 0 B/query. The mesh arena, circumcenter arrays and Sutherland-Hodgman ping-pong buffers are all pooled -- 0 B beyond the facade. The torture gate proves 0 major GC across a rebuild storm and ~200k `cell()` queries, with `tracker.size()` back to 0 after the build/dispose cycles.
+
+---
+
+## Field index: scattered data to regular grids
+
+**New in 1.3.0.** Where `createCellIndex` answers "what region does each point own?", `createFieldIndex` answers "what is the field's value *here*?" -- it triangulates the mesh once and then **interpolates a scalar field** over it: locate a triangle, get barycentric weights, and rasterize a scattered cloud onto a regular grid (a heatmap, a contour source, a resampled field). The key move is that **one mesh serves many scalar fields**: `pxs`/`pys` fix the geometry at build, and every query takes the `zs` values *per call* (indexed by ORIGINAL point index), so you interpolate temperature, then pressure, then elevation over the same cloud without rebuilding.
+
+The core is a remembering **visibility walk** that starts from the last hit triangle, so a coherent query stream -- a raster scan, a dragged cursor -- costs O(1) amortised steps; a cold jump costs O(sqrt(T)). The factory is `(pxs, pys, n) -> FieldIndex`:
+
+```js
+import { createFieldIndex } from '@zakkster/lite-delaunay';
+
+const factory = createFieldIndex(20_000);
+const index = factory(pxs, pys, n);   // SoA coords in, allocation-free handle out
+
+// Interpolate a scalar field at one point (zs is indexed by ORIGINAL index).
+const v = index.interpolate(zs, qx, qy);   // NaN outside the hull
+
+// Rasterize the whole field into a caller-owned 64x64 grid over a bbox.
+const grid = new Float32Array(64 * 64);
+const finite = index.sampleField(zs, 64, 64, bx0, by0, bx1, by1, grid);
+// `finite` is the count of cells inside the hull; the rest are NaN.
+
+index.dispose();   // dispose before rebuilding on a data change
+```
+
+`sampleField` writes **row-major**, `index = row*gridW + col`, with col 0 at `bx0` (xMin) and row 0 at `by0` (yMin) -- a **mathematical +y-up** orientation, deliberately *not* screen convention: a pixel-space consumer flips rows itself and derives any present-mask itself, on its own cold path. Sampling is at cell centers; cells outside the convex hull get `NaN`, and a degenerate build NaN-fills the grid and returns `0`. A `NaN` z-value is confined to its incident triangles -- it propagates arithmetically into exactly those cells, never elsewhere.
+
+### Sizing
+
+Per-slot memory is `~100*maxPoints` bytes + 16 KB -- the mesh arena, an f64 scratch, the original<->compacted index maps and a z-gather buffer, and **no circumcenters**, so it is lighter than the cell slot. Pooling, the ~48 B per-build facade, and generation-stamped fail-closed handles are **identical to the cell index**: one factory serves many concurrent handles, `dispose()` returns the slot, and every query is 0 B. The torture gate proves 0 major GC across a rebuild storm plus ~200k `locate`/`interpolate` queries and 256 `sampleField` rasterizations, with `tracker.size()` back to 0. `triangleVertices` and `triangleCount` reserve per-triangle site access for future contour / TIN work.
 
 ---
 

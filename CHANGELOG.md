@@ -3,6 +3,50 @@
 All notable changes to `@zakkster/lite-delaunay` are documented here. The format
 is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [1.3.0] - 2026-09-03
+
+### Added
+
+- `createFieldIndex(maxPoints)` -- a pooled field-index factory (0 B/query; ~48 B
+  facade per build) for scattered-data point location and scalar-field
+  interpolation. The returned function `(pxs, pys, n) -> FieldIndex` triangulates
+  the Delaunay mesh ONCE; the handle exposes `locate`, `barycentric`,
+  `triangleVertices`, `triangleCount`, `interpolate`, `sampleField` and
+  `dispose`. One mesh serves many scalar fields: geometry is fixed at build, and
+  each query takes its `zs` per-call, indexed by ORIGINAL point index.
+  - Point location is a remembering visibility (straight) walk over the half-edge
+    mesh, starting from the last hit triangle (coherent O(1) amortised, cold
+    O(sqrt(T))). The walk provably terminates on a Delaunay mesh; a step budget
+    covers f64-degenerate cycling by falling back to an O(T) linear scan -- never
+    wrong, maybe slow.
+  - `sampleField(zs, gridW, gridH, bx0, by0, bx1, by1, outGrid) -> finiteCount`
+    rasterizes the field onto a regular grid. GRID CONTRACT: row-major,
+    `index = row*gridW + col`, col 0 at `bx0` (xMin), row 0 at `by0` (yMin) --
+    MATHEMATICAL +y-up orientation, deliberately NOT screen convention (a
+    pixel-space consumer flips rows and derives its own present-mask, on its own
+    cold path). Cell-CENTER sampling; cells outside the hull get `NaN`; a
+    degenerate build NaN-fills the `gridW*gridH` prefix and returns `0`.
+  - Fail closed everywhere (NaN is the absent value, never 0 -- 0 is a legal
+    field value): a non-finite or outside-the-hull query yields `-1` / `NaN`; a
+    degenerate build yields `-1` / `NaN` / `triangleCount() === 0`; a near-zero
+    area triangle makes `barycentric` write `NaN,NaN,NaN` and return `false`; a
+    `NaN` z-value propagates arithmetically, confined to its incident triangles.
+    Out-of-range / NaN queries are VALUES, never throws. Disposed / stale handle
+    use, `t` out of `[0, triangleCount())`, a too-short out-array, a missing /
+    short `zs`, non-positive `gridW`/`gridH`, a wrong-type / too-short `outGrid`,
+    and a non-finite or non-strictly-ordered bbox all THROW.
+  - Pooling, facade and generation semantics are IDENTICAL to `createCellIndex`:
+    one factory serves many concurrent live handles, builds acquire a pooled slot
+    and disposes return it, a new slot is allocated only at a new concurrent
+    high-water mark, every query is 0 B, and a stale or double-disposed handle
+    throws. Per-slot memory is `~100*maxPoints` bytes + 16 KB (no circumcenters).
+  - `triangleVertices` and `triangleCount` reserve per-triangle site access for
+    future contour / TIN work.
+  - Torture harness extended with a field-index rebuild storm (build/dispose
+    interleaved with `locate`/`interpolate`/`sampleField`, lite-leak tracked) and
+    a field steady-state phase (one build, ~200k walk/interpolate queries plus
+    256 `sampleField` rasterizations, gated to `major=0`).
+
 ## [1.2.0] - 2026-09-03
 
 ### Added

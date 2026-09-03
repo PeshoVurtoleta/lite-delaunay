@@ -115,20 +115,41 @@ draw:
   itself turned out to need NOTHING from delaunay (it is a charts-side
   tolerance policy over the existing k=1 spatial query -- see the brief's D1).
 
-## v1.3.0 -- mesh interpolation (unlocks: contour + field charts from scattered data)
+## v1.3.0 -- mesh interpolation (SHIPPED: `createFieldIndex`)
 
-- `locate(qx, qy) -> triangleIndex | -1` (exposes the v1.1.0 walk as public
-  API) and `barycentric(t, qx, qy, outW3)` -- together: zero-alloc scattered
-  data interpolation `z(q) = w0*z[a] + w1*z[b] + w2*z[c]`.
-- `sampleField(zValues, gridW, gridH, bbox, outGrid)` -- rasterize the
-  interpolated surface into a caller-owned Float32Array grid in one call
-  (walk-based location makes row-major sampling near-linear).
-- What it enables: lite-charts contour/isoline charts and
-  heatmap-from-scatter -- today's heatmap kernel needs a regular grid;
-  sampleField turns irregular sensor/telemetry point clouds into exactly
-  that grid, so the EXISTING grid kernel renders fields with no new chart
-  kernel. Natural-neighbor interpolation is explicitly OUT (needs per-query
-  virtual insertion; revisit only with a measured need).
+Consumer input source: the LiteCharts session (2026-09-03) reconciled the
+planner sketch below. No formal charts brief existed for this capability -- the
+surface was USER-AUTHORIZED and shaped by that session's constraints:
+mathematical (+y-up) grid orientation (charts flips rows + derives its own
+present-mask on its own cold path, so the library stays screen-agnostic); the
+outer `field:` config key is RESERVED, not yet consumed (charts wires it via a
+future brief); and `triangleVertices` is reserved for a future TIN / contour
+walker. Correction to the sketch: v1.3.0 does NOT "expose the v1.1.0 walk as
+public API" -- v1.1.0 shipped a uniform GRID (`createSpatialIndex`), never a mesh
+walk; the remembering visibility walk here is NEW code written for 1.3.0.
+
+- `export const createFieldIndex = (maxPoints) => (pxs, pys, n) => fieldIndex` --
+  a pooled factory-factory mirroring `createCellIndex` exactly (SoA input, NaN
+  compaction, ORIGINAL indices, generation-stamped ~48 B facade, one factory /
+  many concurrent handles). The build triangulates ONCE; no circumcenters, so a
+  lighter slot (`~100*maxPoints` bytes + 16 KB). One mesh serves many `zs`
+  fields (geometry fixed at build, `zs` supplied per query).
+- `locate(qx, qy) -> triangleIndex | -1` (a remembering visibility walk from the
+  last hit triangle) and `barycentric(t, qx, qy, outW3) -> boolean` -- together:
+  zero-alloc scattered-data interpolation `z(q) = w0*z[a] + w1*z[b] + w2*z[c]`
+  via `interpolate(zs, qx, qy)`. 0 B/query.
+- `sampleField(zs, gridW, gridH, bx0, by0, bx1, by1, outGrid) -> finiteCount` --
+  rasterize the interpolated surface into a caller-owned grid in one call
+  (serpentine scan keeps the walk cursor coherent, so row-major sampling is
+  near-linear). Row-major, mathematical +y-up, cell-center sampling; outside-hull
+  cells are NaN; a degenerate build NaN-fills and returns 0.
+- What it enables: lite-charts contour/isoline charts and heatmap-from-scatter --
+  `sampleField` turns irregular sensor/telemetry point clouds into a regular
+  grid. Do NOT claim this feeds the charts heatmap kernel verbatim: their
+  internal grid is unstable surface, and their bridge flips rows + derives its
+  own present-mask.
+- Natural-neighbor interpolation stays explicitly OUT (needs per-query virtual
+  insertion; revisit only with a measured need).
 
 ## v1.4.0 -- hulls and outlines (unlocks: cluster overlays on scatter)
 

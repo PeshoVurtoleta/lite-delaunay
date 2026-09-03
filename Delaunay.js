@@ -36,7 +36,7 @@
  * are bumped in the same commit or not at all (packaging law).
  * @type {string}
  */
-export const VERSION = "1.2.0";
+export const VERSION = "1.3.0";
 
 // IEEE 754 double machine-epsilon. Used for the near-duplicate-point skip
 // in the advancing-front loop (matches Mapbox Delaunator's tolerance).
@@ -1537,6 +1537,636 @@ export const createCellIndex = (maxPoints) => {
         // slot is now stale and will throw.
         slot.gen++;
         const facade = Object.create(CELL_FACADE_PROTO);
+        facade._slot = slot;
+        facade._gen = slot.gen;
+        return facade;
+    };
+};
+
+// ===========================================================================
+// Field index (v1.3.0) -- scattered-data to regular-grid interpolation.
+// ===========================================================================
+//
+// `createFieldIndex(maxPoints)` returns a BUILD function
+// `(pxs, pys, n) -> fieldIndex` that triangulates the Delaunay mesh once and
+// then answers point-location and barycentric-interpolation queries against it.
+// One mesh serves MANY scalar fields: `pxs`/`pys` fix the geometry at build
+// time, and every query takes the `zs` values per-call (indexed by ORIGINAL
+// point index), so a caller can interpolate temperature, then pressure, then
+// elevation over the same cloud without rebuilding.
+//
+// The core is a remembering visibility (straight) walk over the half-edge mesh:
+// `locate(qx, qy)` starts from the last hit triangle (`slot.cursor`), so a
+// coherent stream of nearby queries -- a raster scan, a dragged cursor -- costs
+// O(1) amortised steps; a cold jump costs O(sqrt(T)). The walk provably
+// terminates on a Delaunay mesh; a step budget (`stepCap`) covers f64-degenerate
+// cycling by falling back to an O(T) linear scan -- never wrong, maybe slow.
+//
+// Pooling / facade / generation semantics are IDENTICAL to createCellIndex and
+// createSpatialIndex: one factory, many concurrent handles; a build acquires a
+// pooled slot and bumps its generation stamp; dispose bumps it again and returns
+// the slot; a stale or disposed facade THROWS. A build allocates exactly one
+// small facade (~48 B, young-gen). Every query is 0 B. There are no
+// circumcenters -- this is a lighter slot than the cell index.
+
+/**
+ * Cold error-message factory for the field index. All throw strings are built
+ * (and thrown) HERE, off every hot method body -- the guard CONDITIONS live in
+ * the methods, but not the byte cost of their messages.
+ *
+ * @param {string} code message selector
+ * @param {*} [a] first interpolated value
+ * @param {*} [b] second interpolated value
+ * @returns {never} always throws
+ */
+function _fieldThrow(code, a, b) {
+    switch (code) {
+        case 'maxp':
+            throw new Error(`lite-delaunay: maxPoints must be a non-negative integer, got ${a}`);
+        case 'n':
+            throw new Error(`lite-delaunay: n must be a non-negative integer, got ${a}`);
+        case 'nmax':
+            throw new Error(`lite-delaunay: n (${a}) exceeds field index max (${b})`);
+        case 'arr':
+            throw new Error("lite-delaunay: pxs and pys are required");
+        case 'arrlen':
+            throw new Error(`lite-delaunay: pxs/pys shorter than n (${a})`);
+        case 'disposed':
+            throw new Error(`lite-delaunay: ${a} called on a disposed field index`);
+        case 'ddispose':
+            throw new Error("lite-delaunay: dispose called on an already-disposed field index");
+        case 'trange':
+            throw new Error(`lite-delaunay: triangle t (${a}) out of range [0, ${b})`);
+        case 'outshort':
+            throw new Error(`lite-delaunay: ${a} too short (need length >= ${b})`);
+        case 'zs':
+            throw new Error(`lite-delaunay: zs required with length >= n (${a})`);
+        case 'grid':
+            throw new Error("lite-delaunay: gridW and gridH must be positive integers");
+        case 'outgrid':
+            throw new Error("lite-delaunay: outGrid must be a Float32Array/Float64Array of length >= gridW*gridH");
+        case 'bbox':
+            throw new Error("lite-delaunay: bbox must be finite with bx0 < bx1 and by0 < by1");
+    }
+}
+
+/**
+ * Cold O(T) fallback locator: scan every triangle for the one that contains
+ * (qx, qy) using the same three-directed-edge cross test as the walk. Returns
+ * the first containing triangle, or -1 if the point is outside the hull. No
+ * allocation, no strings; only reached when the walk exhausts its step budget.
+ *
+ * @param {object} slot the pooled slot
+ * @param {number} qx query x
+ * @param {number} qy query y
+ * @returns {number} containing compacted-mesh triangle id, or -1
+ */
+function _fieldLinearScan(slot, qx, qy) {
+    const triangles = slot.tri.triangles;
+    const S = slot.scratch;
+    const orientSign = slot.orientSign;
+    const T = slot.triCount;
+    for (let t = 0; t < T; t++) {
+        const e0 = 3 * t;
+        let inside = true;
+        for (let j = 0; j < 3; j++) {
+            const e = e0 + j;
+            const va = triangles[e];
+            const eb = (j === 2) ? e0 : e + 1; // nextHalfedge(e)
+            const vb = triangles[eb];
+            const x1 = S[2 * va], y1 = S[2 * va + 1];
+            const x2 = S[2 * vb], y2 = S[2 * vb + 1];
+            const cross = orientSign * ((x2 - x1) * (qy - y1) - (y2 - y1) * (qx - x1));
+            if (cross < 0) { inside = false; break; }
+        }
+        if (inside) return t;
+    }
+    return -1;
+}
+
+/**
+ * Remembering visibility (straight) walk from a given start triangle. Steps
+ * across the first directed edge whose outward cross is negative; a hull edge
+ * (halfedge -1) on that side means the query is outside the convex hull, so
+ * return -1. If no edge is crossed the triangle contains q (on-edge counts as
+ * inside), so return it. On step-budget exhaustion fall back to the linear
+ * scan. Module-level, zero allocation, never throws, never builds a string.
+ *
+ * @param {object} slot the pooled slot
+ * @param {number} qx query x
+ * @param {number} qy query y
+ * @param {number} t start triangle id (clamped into [0, T))
+ * @returns {number} containing compacted-mesh triangle id, or -1
+ */
+function _fieldWalkFrom(slot, qx, qy, t) {
+    const triangles = slot.tri.triangles;
+    const halfedges = slot.tri.halfedges;
+    const S = slot.scratch;
+    const orientSign = slot.orientSign;
+    const T = slot.triCount;
+    if (t < 0) t = 0; else if (t >= T) t = T - 1;
+    let budget = slot.stepCap;
+    while (budget > 0) {
+        budget--;
+        const e0 = 3 * t;
+        let moved = 0;
+        for (let j = 0; j < 3; j++) {
+            const e = e0 + j;
+            const va = triangles[e];
+            const eb = (j === 2) ? e0 : e + 1; // nextHalfedge(e)
+            const vb = triangles[eb];
+            const x1 = S[2 * va], y1 = S[2 * va + 1];
+            const x2 = S[2 * vb], y2 = S[2 * vb + 1];
+            const cross = orientSign * ((x2 - x1) * (qy - y1) - (y2 - y1) * (qx - x1));
+            if (cross < 0) {
+                const tw = halfedges[e];
+                if (tw === -1) return -1; // strictly outside a hull-edge half-plane
+                t = (tw / 3) | 0;
+                moved = 1;
+                break;
+            }
+        }
+        if (moved === 0) return t; // contained
+    }
+    return _fieldLinearScan(slot, qx, qy);
+}
+
+/**
+ * Compute the barycentric weights (w0, w1, w2) of (qx, qy) in triangle `t` and
+ * write them into `out`. A near-zero-area triangle (relative guard mirroring the
+ * cell circumcenter guard) writes NaN,NaN,NaN and returns false. Otherwise
+ * returns true iff q is inside-or-on `t` (every weight >= -1e-9). Zero
+ * allocation. w0/w1/w2 correspond to the triangle's three mesh vertices in order.
+ *
+ * @param {object} slot the pooled slot
+ * @param {number} t compacted-mesh triangle id (caller guarantees in range)
+ * @param {number} qx query x
+ * @param {number} qy query y
+ * @param {Float32Array|Float64Array|number[]} out length >= 3
+ * @returns {boolean} true iff inside-or-on
+ */
+function _fieldBary(slot, t, qx, qy, out) {
+    const triangles = slot.tri.triangles;
+    const S = slot.scratch;
+    const e0 = 3 * t;
+    const ia = triangles[e0], ib = triangles[e0 + 1], ic = triangles[e0 + 2];
+    const ax = S[2 * ia], ay = S[2 * ia + 1];
+    const bx = S[2 * ib], by = S[2 * ib + 1];
+    const cx = S[2 * ic], cy = S[2 * ic + 1];
+    const v0x = bx - ax, v0y = by - ay;
+    const v1x = cx - ax, v1y = cy - ay;
+    const d = v0x * v1y - v0y * v1x; // signed doubled area
+    const scale = (v0x * v0x + v0y * v0y) + (v1x * v1x + v1y * v1y);
+    // Relative degeneracy guard: mirror the cell circumcenter guard's
+    // `!(|d| > EPSILON*scale)` form, which also traps a NaN denominator.
+    if (scale === 0 || !(Math.abs(d) > EPSILON * scale)) {
+        out[0] = NaN; out[1] = NaN; out[2] = NaN;
+        return false;
+    }
+    const qx0 = qx - ax, qy0 = qy - ay;
+    const w1 = (qx0 * v1y - qy0 * v1x) / d;
+    const w2 = (v0x * qy0 - v0y * qx0) / d;
+    const w0 = 1 - w1 - w2;
+    out[0] = w0; out[1] = w1; out[2] = w2;
+    return (w0 >= -1e-9 && w1 >= -1e-9 && w2 >= -1e-9);
+}
+
+/**
+ * Locate the compacted-mesh triangle containing (qx, qy). Returns a triangle id
+ * in [0, triangleCount), or -1 for a non-finite query, a degenerate build, or a
+ * point outside the convex hull. Updates the walk cursor on a hit for coherence.
+ * z-agnostic.
+ *
+ * @this {object} per-build field-index facade ({ _slot, _gen })
+ * @param {number} qx query x
+ * @param {number} qy query y
+ * @returns {number} triangle id, or -1
+ * @throws {Error} if the handle is disposed or stale
+ */
+function _fieldLocate(qx, qy) {
+    const s = this._slot;
+    if (s === null || this._gen !== s.gen) _fieldThrow('disposed', 'locate');
+    if (!Number.isFinite(qx) || !Number.isFinite(qy)) return -1;
+    if (s.degenerate) return -1;
+    const t = _fieldWalkFrom(s, qx, qy, s.cursor);
+    if (t >= 0) s.cursor = t;
+    return t;
+}
+
+/**
+ * Write the barycentric weights of (qx, qy) in triangle `t` into `outW3`
+ * (ALWAYS all three), returning true iff q is inside-or-on `t`. A near-zero-area
+ * triangle writes NaN,NaN,NaN and returns false.
+ *
+ * @this {object} per-build field-index facade ({ _slot, _gen })
+ * @param {number} t compacted-mesh triangle id in [0, triangleCount)
+ * @param {number} qx query x
+ * @param {number} qy query y
+ * @param {Float32Array|Float64Array|number[]} outW3 length >= 3
+ * @returns {boolean} true iff inside-or-on
+ * @throws {Error} if disposed/stale, `t` out of range, or `outW3` too short
+ */
+function _fieldBarycentric(t, qx, qy, outW3) {
+    const s = this._slot;
+    if (s === null || this._gen !== s.gen) _fieldThrow('disposed', 'barycentric');
+    const T = s.triCount;
+    if (!Number.isInteger(t) || t < 0 || t >= T) _fieldThrow('trange', t, T);
+    if (outW3 == null || outW3.length < 3) _fieldThrow('outshort', 'outW3', 3);
+    return _fieldBary(s, t, qx, qy, outW3);
+}
+
+/**
+ * Write triangle `t`'s three ORIGINAL point indices (via vert2orig) into
+ * `outI3`. Reserves per-triangle site access for future contour / TIN work.
+ *
+ * @this {object} per-build field-index facade ({ _slot, _gen })
+ * @param {number} t compacted-mesh triangle id in [0, triangleCount)
+ * @param {Int32Array|number[]} outI3 length >= 3
+ * @returns {void}
+ * @throws {Error} if disposed/stale, `t` out of range, or `outI3` too short
+ */
+function _fieldTriangleVertices(t, outI3) {
+    const s = this._slot;
+    if (s === null || this._gen !== s.gen) _fieldThrow('disposed', 'triangleVertices');
+    const T = s.triCount;
+    if (!Number.isInteger(t) || t < 0 || t >= T) _fieldThrow('trange', t, T);
+    if (outI3 == null || outI3.length < 3) _fieldThrow('outshort', 'outI3', 3);
+    const triangles = s.tri.triangles;
+    const v2o = s.vert2orig;
+    const e0 = 3 * t;
+    outI3[0] = v2o[triangles[e0]];
+    outI3[1] = v2o[triangles[e0 + 1]];
+    outI3[2] = v2o[triangles[e0 + 2]];
+}
+
+/**
+ * Number of triangles in the built mesh. 0 on a degenerate build.
+ *
+ * @this {object} per-build field-index facade ({ _slot, _gen })
+ * @returns {number}
+ * @throws {Error} if the handle is disposed or stale
+ */
+function _fieldTriangleCount() {
+    const s = this._slot;
+    if (s === null || this._gen !== s.gen) _fieldThrow('disposed', 'triangleCount');
+    return s.degenerate ? 0 : s.triCount;
+}
+
+/**
+ * Interpolate the scalar field `zs` at (qx, qy): locate the containing triangle,
+ * compute barycentric weights, return the weighted sum of `zs` at the triangle's
+ * three ORIGINAL vertex indices. NaN when the query is non-finite, the build is
+ * degenerate, the point is outside the hull, or the area guard fails. A NaN-z
+ * corner propagates arithmetically (no branch). `zs` is indexed by ORIGINAL
+ * point index. Zero allocation.
+ *
+ * @this {object} per-build field-index facade ({ _slot, _gen })
+ * @param {Float32Array|Float64Array|number[]} zs scalar values, length >= n
+ * @param {number} qx query x
+ * @param {number} qy query y
+ * @returns {number} interpolated value, or NaN
+ * @throws {Error} if disposed/stale or `zs` missing/short
+ */
+function _fieldInterpolate(zs, qx, qy) {
+    const s = this._slot;
+    if (s === null || this._gen !== s.gen) _fieldThrow('disposed', 'interpolate');
+    const n = s.n;
+    if (zs == null || zs.length < n) _fieldThrow('zs', n);
+    if (!Number.isFinite(qx) || !Number.isFinite(qy)) return NaN;
+    if (s.degenerate) return NaN;
+    const t = _fieldWalkFrom(s, qx, qy, s.cursor);
+    if (t < 0) return NaN;
+    s.cursor = t;
+    const triangles = s.tri.triangles;
+    const S = s.scratch;
+    const v2o = s.vert2orig;
+    const e0 = 3 * t;
+    const ia = triangles[e0], ib = triangles[e0 + 1], ic = triangles[e0 + 2];
+    const ax = S[2 * ia], ay = S[2 * ia + 1];
+    const bx = S[2 * ib], by = S[2 * ib + 1];
+    const cx = S[2 * ic], cy = S[2 * ic + 1];
+    const v0x = bx - ax, v0y = by - ay;
+    const v1x = cx - ax, v1y = cy - ay;
+    const d = v0x * v1y - v0y * v1x;
+    const scale = (v0x * v0x + v0y * v0y) + (v1x * v1x + v1y * v1y);
+    if (scale === 0 || !(Math.abs(d) > EPSILON * scale)) return NaN;
+    const qx0 = qx - ax, qy0 = qy - ay;
+    const w1 = (qx0 * v1y - qy0 * v1x) / d;
+    const w2 = (v0x * qy0 - v0y * qx0) / d;
+    const w0 = 1 - w1 - w2;
+    return w0 * zs[v2o[ia]] + w1 * zs[v2o[ib]] + w2 * zs[v2o[ic]];
+}
+
+/**
+ * Rasterize the scalar field `zs` onto a regular grid, writing into `outGrid`
+ * and returning the count of FINITE cells written.
+ *
+ * GRID CONTRACT (the consumer contract -- document exactly this): row-major,
+ * index = row*gridW + col; col 0 at bx0 (xMin), row 0 at by0 (yMin) --
+ * MATHEMATICAL +y-up orientation, deliberately NOT screen convention (a
+ * pixel-space consumer flips rows itself, on its own cold path). Cell-CENTER
+ * sampling: x_j = bx0 + (j + 0.5) * (bx1 - bx0) / gridW,
+ * y_i = by0 + (i + 0.5) * (by1 - by0) / gridH. Cells outside the hull get NaN.
+ * A degenerate build fills the whole gridW*gridH prefix with NaN and returns 0.
+ *
+ * The mesh values are gathered once into the pooled `zv` (zv[v] = zs[orig(v)])
+ * so the inner loop reads `zv[vertex]` directly, and the scan is serpentine
+ * (boustrophedon) so the walk cursor stays coherent at row ends -- but WRITES
+ * stay row-major. A NaN-z corner propagates arithmetically, confined to its
+ * incident triangles.
+ *
+ * @this {object} per-build field-index facade ({ _slot, _gen })
+ * @param {Float32Array|Float64Array|number[]} zs scalar values, length >= n
+ * @param {number} gridW grid columns (positive integer)
+ * @param {number} gridH grid rows (positive integer)
+ * @param {number} bx0 bbox min x
+ * @param {number} by0 bbox min y
+ * @param {number} bx1 bbox max x (must be > bx0)
+ * @param {number} by1 bbox max y (must be > by0)
+ * @param {Float32Array|Float64Array} outGrid length >= gridW*gridH
+ * @returns {number} count of finite cells written
+ * @throws {Error} if disposed/stale; `zs` missing/short; gridW/gridH not
+ *   positive integers; outGrid wrong type or too short; or the bbox is
+ *   non-finite or not strictly ordered
+ */
+function _fieldSampleField(zs, gridW, gridH, bx0, by0, bx1, by1, outGrid) {
+    const s = this._slot;
+    if (s === null || this._gen !== s.gen) _fieldThrow('disposed', 'sampleField');
+    const n = s.n;
+    if (zs == null || zs.length < n) _fieldThrow('zs', n);
+    if (!Number.isInteger(gridW) || gridW <= 0 || !Number.isInteger(gridH) || gridH <= 0) {
+        _fieldThrow('grid');
+    }
+    if (outGrid == null ||
+        !(outGrid instanceof Float32Array || outGrid instanceof Float64Array) ||
+        outGrid.length < gridW * gridH) {
+        _fieldThrow('outgrid');
+    }
+    if (bx0 !== bx0 || by0 !== by0 || bx1 !== bx1 || by1 !== by1 ||
+        bx0 === Infinity || bx0 === -Infinity || by0 === Infinity || by0 === -Infinity ||
+        bx1 === Infinity || bx1 === -Infinity || by1 === Infinity || by1 === -Infinity ||
+        !(bx0 < bx1) || !(by0 < by1)) {
+        _fieldThrow('bbox');
+    }
+
+    const total = gridW * gridH;
+    // Degenerate build: NaN the whole prefix, return 0 (tested ONCE, not per cell).
+    if (s.degenerate) {
+        for (let k = 0; k < total; k++) outGrid[k] = NaN;
+        return 0;
+    }
+
+    // GATHER once: zv[v] = zs[orig(v)] so the grid loop reads zv[vertex] with no
+    // double indirection.
+    const m = s.m;
+    const v2o = s.vert2orig;
+    const zv = s.zv;
+    for (let v = 0; v < m; v++) zv[v] = zs[v2o[v]];
+
+    const triangles = s.tri.triangles;
+    const S = s.scratch;
+    const dx = (bx1 - bx0) / gridW;
+    const dy = (by1 - by0) / gridH;
+    const T = s.triCount;
+    let cursor = s.cursor;
+    if (cursor < 0) cursor = 0; else if (cursor >= T) cursor = T - 1;
+    let count = 0;
+
+    for (let row = 0; row < gridH; row++) {
+        const qy = by0 + (row + 0.5) * dy;
+        const base = row * gridW;
+        const ltr = (row & 1) === 0; // serpentine: alternate scan direction
+        for (let cc = 0; cc < gridW; cc++) {
+            const col = ltr ? cc : (gridW - 1 - cc);
+            const qx = bx0 + (col + 0.5) * dx;
+            const t = _fieldWalkFrom(s, qx, qy, cursor);
+            let val = NaN;
+            if (t >= 0) {
+                cursor = t;
+                const e0 = 3 * t;
+                const ia = triangles[e0], ib = triangles[e0 + 1], ic = triangles[e0 + 2];
+                const ax = S[2 * ia], ay = S[2 * ia + 1];
+                const bx = S[2 * ib], by = S[2 * ib + 1];
+                const cx = S[2 * ic], cy = S[2 * ic + 1];
+                const v0x = bx - ax, v0y = by - ay;
+                const v1x = cx - ax, v1y = cy - ay;
+                const d = v0x * v1y - v0y * v1x;
+                const scale = (v0x * v0x + v0y * v0y) + (v1x * v1x + v1y * v1y);
+                if (!(scale === 0) && Math.abs(d) > EPSILON * scale) {
+                    const qx0 = qx - ax, qy0 = qy - ay;
+                    const w1 = (qx0 * v1y - qy0 * v1x) / d;
+                    const w2 = (v0x * qy0 - v0y * qx0) / d;
+                    const w0 = 1 - w1 - w2;
+                    // zv[vertex]: NaN-z propagates arithmetically, no branch.
+                    val = w0 * zv[ia] + w1 * zv[ib] + w2 * zv[ic];
+                }
+            }
+            outGrid[base + col] = val; // WRITES stay row-major
+            if (Number.isFinite(val)) count++;
+        }
+    }
+    s.cursor = cursor;
+    return count;
+}
+
+/**
+ * Release a per-build field-index facade and return its pooled slot to the
+ * factory. Byte-identical semantics to `_cellDispose`: bump the slot generation
+ * (invalidating every outstanding facade of this build), detach this facade so a
+ * second dispose fails closed, and push the slot back on the free stack.
+ *
+ * @this {object} per-build field-index facade ({ _slot, _gen })
+ * @throws {Error} if already disposed / stale
+ */
+function _fieldDispose() {
+    const s = this._slot;
+    if (s === null || this._gen !== s.gen) _fieldThrow('ddispose');
+    this._slot = null;
+    s.gen++;
+    const pool = s._pool;
+    pool.freeStack[pool.freeCount++] = s.poolIndex;
+}
+
+/**
+ * Frozen shared prototype for the per-build field-index facade. Every method
+ * lives here ONCE, so a build never allocates fresh closures.
+ */
+const FIELD_FACADE_PROTO = Object.freeze({
+    locate: _fieldLocate,
+    barycentric: _fieldBarycentric,
+    triangleVertices: _fieldTriangleVertices,
+    triangleCount: _fieldTriangleCount,
+    interpolate: _fieldInterpolate,
+    sampleField: _fieldSampleField,
+    dispose: _fieldDispose,
+});
+
+/**
+ * Allocate one pooled field-index slot: the triangulator arena, the interleave
+ * scratch, the orig2v / vert2orig maps and the per-vertex z-gather buffer. Only
+ * ever called at a new concurrent high-water mark. No circumcenters -- this is a
+ * lighter slot than the cell index. The slot carries no methods.
+ *
+ * @param {number} maxPoints capacity
+ * @param {object} pool the factory's pool bookkeeping
+ * @param {number} poolIndex this slot's index in pool.slots
+ * @returns {object} the pooled slot
+ */
+function _createFieldSlot(maxPoints, pool, poolIndex) {
+    return {
+        _pool: pool,
+        poolIndex,
+        // Generation stamp: bumped on every build and every dispose.
+        gen: 0,
+        maxPoints,
+        // Per-build state (set by _buildFieldSlot).
+        n: 0, m: 0, triCount: 0, degenerate: true,
+        // Walk state: last-hit triangle, mesh winding sign, step budget.
+        cursor: 0, orientSign: 1, stepCap: 0,
+        // The mesh engine and its f64 interleave scratch [x0,y0,x1,y1,...].
+        tri: new DelaunayTriangulator(maxPoints),
+        scratch: new Float64Array(2 * maxPoints),
+        // orig2v[i] = compacted vertex for original index i (-1 = non-finite);
+        // vert2orig[v] = original index for compacted vertex v.
+        orig2v: new Int32Array(maxPoints),
+        vert2orig: new Int32Array(maxPoints),
+        // Per-vertex z-gather buffer (zv[v] = zs[vert2orig[v]]) reused per
+        // sampleField call so the grid loop reads zv[vertex] with zero alloc.
+        zv: new Float64Array(maxPoints),
+    };
+}
+
+/**
+ * (Re)build the mesh for a slot from SoA coordinates. Compacts only finite
+ * points, triangulates, derives the global winding sign and the walk step cap.
+ * Zero allocation. No circumcenters, no inEdge map.
+ *
+ * @param {object} slot the pooled slot
+ * @param {ArrayLike<number>} pxs x coordinates
+ * @param {ArrayLike<number>} pys y coordinates
+ * @param {number} n logical point count
+ */
+function _buildFieldSlot(slot, pxs, pys, n) {
+    const orig2v = slot.orig2v, vert2orig = slot.vert2orig, S = slot.scratch;
+    slot.n = n;
+    slot.degenerate = true;
+    slot.triCount = 0;
+    slot.cursor = 0;
+    slot.orientSign = 1;
+    slot.stepCap = 0;
+
+    // 1. Compact ONLY finite points; record original<->compacted index maps and
+    //    interleave the compacted coords into the f64 scratch in one pass.
+    orig2v.fill(-1, 0, n);
+    let m = 0;
+    for (let i = 0; i < n; i++) {
+        const px = pxs[i], py = pys[i];
+        if (px !== px || py !== py ||
+            px === Infinity || px === -Infinity ||
+            py === Infinity || py === -Infinity) {
+            continue;
+        }
+        orig2v[i] = m; vert2orig[m] = i;
+        S[2 * m] = px; S[2 * m + 1] = py;
+        m++;
+    }
+    slot.m = m;
+
+    // Fewer than 3 finite points: no triangulation exists -- degenerate stays.
+    if (m < 3) return;
+
+    const triCount = slot.tri.triangulate(S, m);
+    if (triCount === 0) return; // collinear / coincident -- degenerate stays true
+    slot.triCount = triCount;
+    slot.degenerate = false;
+
+    // Global winding sign from triangle 0's signed doubled area (the mesh has
+    // uniform winding, so one sign serves every containment test).
+    const triangles = slot.tri.triangles;
+    const ia = triangles[0], ib = triangles[1], ic = triangles[2];
+    const ax = S[2 * ia], ay = S[2 * ia + 1];
+    const bx = S[2 * ib], by = S[2 * ib + 1];
+    const cx = S[2 * ic], cy = S[2 * ic + 1];
+    const d0 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    slot.orientSign = d0 >= 0 ? 1 : -1;
+    // Step budget: O(sqrt(T)) expected walk length, generously padded; on
+    // exhaustion the walk falls back to a linear scan -- never wrong, maybe slow.
+    slot.stepCap = 4 * Math.ceil(Math.sqrt(triCount)) + 64;
+}
+
+/**
+ * Create a pooled field-index FACTORY sized for up to `maxPoints` points.
+ *
+ * The returned function is `(pxs, pys, n) -> fieldIndex`. It mirrors
+ * {@link createCellIndex} exactly -- pooled factory-factory, SoA input, NaN
+ * compaction, ORIGINAL indices, generation-stamped facades -- but instead of a
+ * Voronoi-cell surface it triangulates the mesh ONCE and answers point-location
+ * and barycentric-interpolation queries with a remembering visibility walk. One
+ * mesh serves MANY scalar fields: geometry is fixed at build, and each query
+ * takes its `zs` per-call (indexed by ORIGINAL point index).
+ *
+ * GRID CONTRACT (`sampleField`): row-major, index = row*gridW + col; col 0 at
+ * bx0 (xMin), row 0 at by0 (yMin) -- MATHEMATICAL +y-up orientation, deliberately
+ * NOT screen convention. A pixel-space consumer flips rows itself and derives
+ * its own present-mask, on its own cold path. Cell-CENTER sampling; cells
+ * outside the hull get NaN; a degenerate build NaN-fills and returns 0.
+ *
+ * `zs` semantics: per-call, indexed by ORIGINAL point index; Float32Array,
+ * Float64Array, or number[] accepted; throws if missing or shorter than the `n`
+ * of THIS build. A NaN z-value propagates arithmetically into its incident
+ * triangles' cells -- no NaN branch on the hot path.
+ *
+ * Memory model: a build allocates exactly one small facade (~48 B, young-gen);
+ * the mesh arena, scratch, index maps and z-gather buffer are all pooled -- 0 B
+ * beyond the facade -- and every query is 0 B. Per-slot memory is
+ * ~100*maxPoints bytes + 16 KB (no circumcenters -- lighter than the cell slot).
+ * A new slot is allocated only at a new concurrent high-water mark.
+ *
+ * @example
+ * // RESERVED future lite-charts wiring (a heatmap / contour layer). The outer
+ * // `field:` key is reserved and NOT YET CONSUMED -- charts will wire it via a
+ * // future brief. Do not treat this output as feeding any charts kernel today.
+ * const chart = createScatterChart({
+ *   data,
+ *   field: { index: createFieldIndex(20_000) }, // reserved -- not yet consumed
+ * });
+ *
+ * @param {number} maxPoints hard upper bound on `n` per build. Must be a
+ *   non-negative integer.
+ * @returns {(pxs: ArrayLike<number>, pys: ArrayLike<number>, n: number) => object}
+ *   the field-index factory.
+ * @throws {Error} if `maxPoints` is not a non-negative integer.
+ */
+export const createFieldIndex = (maxPoints) => {
+    if (!Number.isInteger(maxPoints) || maxPoints < 0) {
+        _fieldThrow('maxp', maxPoints);
+    }
+
+    // Pool bookkeeping, identical in shape to createCellIndex.
+    const pool = { slots: [], freeStack: [], freeCount: 0 };
+
+    return function buildFieldIndex(pxs, pys, n) {
+        // Fail closed at build time -- all guards live here, off the query path.
+        if (!Number.isInteger(n) || n < 0) _fieldThrow('n', n);
+        if (n > maxPoints) _fieldThrow('nmax', n, maxPoints);
+        if (pxs == null || pys == null) _fieldThrow('arr');
+        if (pxs.length < n || pys.length < n) _fieldThrow('arrlen', n);
+
+        // Acquire a free slot, or grow the pool at a new high-water mark.
+        let idx;
+        if (pool.freeCount > 0) {
+            idx = pool.freeStack[--pool.freeCount];
+        } else {
+            idx = pool.slots.length;
+            pool.slots[idx] = _createFieldSlot(maxPoints, pool, idx);
+        }
+        const slot = pool.slots[idx];
+
+        _buildFieldSlot(slot, pxs, pys, n);
+        // New generation for this build; any facade from a prior build of this
+        // slot is now stale and will throw.
+        slot.gen++;
+        const facade = Object.create(FIELD_FACADE_PROTO);
         facade._slot = slot;
         facade._gen = slot.gen;
         return facade;

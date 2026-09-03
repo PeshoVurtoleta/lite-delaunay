@@ -22,7 +22,7 @@ import {
 } from '@zakkster/lite-leak';
 import { effect } from '@zakkster/lite-signal';
 
-import { createSpatialIndex, createCellIndex } from '../Delaunay.js';
+import { createSpatialIndex, createCellIndex, createFieldIndex } from '../Delaunay.js';
 
 const CYCLES = 4096;
 const HOT = 200000;
@@ -35,6 +35,11 @@ const K = 8;
 const CELL_N = 1200;
 const CELL_CYCLES = 512;
 const CELL_HOT = 200000;
+// Field index: a spread cloud with ~3% NaN sites; a rebuild storm plus a
+// steady-state walk/interpolate/rasterize phase gated to major=0.
+const FIELD_N = 1200;
+const FIELD_CYCLES = 512;
+const FIELD_HOT = 200000;
 
 // --- skewed clustered input with ~5% NaN (log-scale / missing-data holes) ---
 // A 10^4:1 density skew: a few tight clusters near the origin plus rare far
@@ -76,6 +81,22 @@ for (let i = 0; i < CELL_N; i++) {
 const cbx0 = 100, cby0 = 100, cbx1 = 900, cby1 = 900;
 const cellOut = new Float64Array(128);  // 64-vertex caller buffer (the sizing rule)
 
+// --- spread cloud for the field index: uniform over 1000x1000, ~3% NaN sites --
+// One mesh, many z fields: geometry fixed at build, zs supplied per query. The
+// zs is indexed by ORIGINAL point index (NaN-site rows are never read).
+const fieldPxs = new Float32Array(FIELD_N);
+const fieldPys = new Float32Array(FIELD_N);
+const fieldZs = new Float64Array(FIELD_N);
+for (let i = 0; i < FIELD_N; i++) {
+  let x = rng() * 1000, y = rng() * 1000;
+  fieldZs[i] = Math.sin(x * 0.01) + Math.cos(y * 0.01);  // a smooth scalar field
+  if (rng() < 0.03) { x = NaN; }  // ~3% NaN sites -- compacted out at build
+  fieldPxs[i] = x; fieldPys[i] = y;
+}
+const fbx0 = 100, fby0 = 100, fbx1 = 900, fby1 = 900;
+const fieldGrid = new Float32Array(4096);  // 64x64 rasterization target
+const fieldW3 = new Float64Array(3);       // barycentric scratch (caller-owned)
+
 // ---------------------------------------------------------------------------
 // leak tracker + kernels
 // ---------------------------------------------------------------------------
@@ -109,10 +130,19 @@ const cellSlotWatch = [];
   cellSlotWatch.push(h._slot);
   h.dispose();
 }
-// One growth kernel watches BOTH pools' HWM (the kernel name is unique per
-// registration, so both collections ride a single registration).
+// Same pooling contract for the field index: one factory, slot HWM watched by
+// identity. A pool that leaked a slot per build would grow this unbounded.
+const fieldFactory = createFieldIndex(MAXP);
+const fieldSlotWatch = [];
+{
+  const h = fieldFactory(fieldPxs, fieldPys, FIELD_N);
+  fieldSlotWatch.push(h._slot);
+  h.dispose();
+}
+// One growth kernel watches ALL THREE pools' HWM (the kernel name is unique per
+// registration, so every collection rides a single registration).
 tracker.registerKernel(createCollectionGrowthKernel({
-  collections: [slotWatch, cellSlotWatch],
+  collections: [slotWatch, cellSlotWatch, fieldSlotWatch],
   window: 8,
   minSamples: 4,
 }));
@@ -162,6 +192,34 @@ for (let i = 0; i < CELL_CYCLES; i++) {
     handle.cell((i * 7 + 3) % CELL_N, cbx0, cby0, cbx1, cby1, cellOut);
     const gen = handle._gen | 0;  // detached primitive, never the handle
     tracker.track(handle, () => { void gen; }, 'cell', { audit: true });
+    handle.dispose();
+  });
+  dispose();
+}
+
+// ---------------------------------------------------------------------------
+// phase 1d: field-index rebuild storm -- build/dispose cycles interleaved with
+// locate/interpolate/sampleField calls, tracked by lite-leak. Proves the slot
+// is released back to the pool every cycle (size() returns to 0) and the pool
+// HWM stays flat (growth kernel on fieldSlotWatch).
+// ---------------------------------------------------------------------------
+for (let i = 0; i < FIELD_CYCLES; i++) {
+  const dispose = effect(() => {
+    const handle = fieldFactory(fieldPxs, fieldPys, FIELD_N);
+    const slot = handle._slot;
+    let known = false;
+    for (let s = 0; s < fieldSlotWatch.length; s++) {
+      if (fieldSlotWatch[s] === slot) { known = true; break; }
+    }
+    if (!known) fieldSlotWatch.push(slot);
+    // Exercise every query path each cycle: a locate, an interpolate, and a
+    // small rasterization into the fixed grid buffer.
+    const qx = 100 + (i % 800), qy = 100 + ((i * 7) % 800);
+    handle.locate(qx, qy);
+    handle.interpolate(fieldZs, qx, qy);
+    handle.sampleField(fieldZs, 16, 16, fbx0, fby0, fbx1, fby1, fieldGrid);
+    const gen = handle._gen | 0;  // detached primitive, never the handle
+    tracker.track(handle, () => { void gen; }, 'field', { audit: true });
     handle.dispose();
   });
   dispose();
@@ -243,10 +301,41 @@ const reportCell = checkNoGc(sCell, { maxMajor: 0, maxPauseMs: 4 });
 gcCell.stop();
 
 // ---------------------------------------------------------------------------
+// phase 4: field-index steady-state -- ONE build, ~200k locate/interpolate
+// queries (coherent drift + 1-in-1024 random jumps) plus 256 sampleField
+// rasterizations into the fixed 64x64 grid. Every query must be 0 B/call
+// (major=0). The serpentine walk keeps the cursor coherent across grid rows.
+// ---------------------------------------------------------------------------
+const gcField = new GcProfiler().start();
+const fieldIndex = fieldFactory(fieldPxs, fieldPys, FIELD_N);  // built ONCE
+let fx = 500, fy = 500;
+for (let i = 0; i < FIELD_HOT; i++) {
+  fx += (rng() - 0.5) * 12;
+  fy += (rng() - 0.5) * 12;
+  if ((i & 1023) === 0) { fx = 100 + rng() * 800; fy = 100 + rng() * 800; }
+  const t = fieldIndex.locate(fx, fy);
+  if (t >= 0) fieldIndex.barycentric(t, fx, fy, fieldW3);
+  fieldIndex.interpolate(fieldZs, fx, fy);
+  if ((i & 8191) === 0) {
+    gcField.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+  }
+}
+for (let i = 0; i < 256; i++) {
+  fieldIndex.sampleField(fieldZs, 64, 64, fbx0, fby0, fbx1, fby1, fieldGrid);
+}
+fieldIndex.dispose();
+
+await new Promise((r) => setTimeout(r, 50));
+const sField = gcField.summary();
+const reportField = checkNoGc(sField, { maxMajor: 0, maxPauseMs: 4 });
+gcField.stop();
+
+// ---------------------------------------------------------------------------
 // gate
 // ---------------------------------------------------------------------------
 const ok = report.ok &&
   reportCell.ok &&
+  reportField.ok &&
   live === 0 &&
   leaks.length === 0 &&
   findings.length === 0 &&
@@ -259,6 +348,8 @@ console.log(
   ' maxMs=' + s.gc.maxMs.toFixed(2) +
   ' | cell major=' + sCell.gc.major + ' minor=' + sCell.gc.minor +
   ' maxMs=' + sCell.gc.maxMs.toFixed(2) +
+  ' | field major=' + sField.gc.major + ' minor=' + sField.gc.minor +
+  ' maxMs=' + sField.gc.maxMs.toFixed(2) +
   ' | rebuild=' + rebuildBytes + ' bytes | ' + (ok ? 'ok' : 'FAIL')
 );
 
@@ -268,6 +359,9 @@ if (!ok) {
   }
   for (const v of reportCell.violations) {
     console.error('  cell-violation ' + v.metric + ' limit=' + v.limit + ' actual=' + v.actual);
+  }
+  for (const v of reportField.violations) {
+    console.error('  field-violation ' + v.metric + ' limit=' + v.limit + ' actual=' + v.actual);
   }
   for (const f of findings) console.error('  finding ' + f.kind + ':' + (f.reason || ''));
   for (const l of leaks) console.error('  leak ' + l);
