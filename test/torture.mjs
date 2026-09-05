@@ -22,7 +22,7 @@ import {
 } from '@zakkster/lite-leak';
 import { effect } from '@zakkster/lite-signal';
 
-import { createSpatialIndex, createCellIndex, createFieldIndex } from '../Delaunay.js';
+import { createSpatialIndex, createCellIndex, createFieldIndex, createClusterIndex } from '../Delaunay.js';
 
 const CYCLES = 4096;
 const HOT = 200000;
@@ -97,6 +97,20 @@ const fbx0 = 100, fby0 = 100, fbx1 = 900, fby1 = 900;
 const fieldGrid = new Float32Array(4096);  // 64x64 rasterization target
 const fieldW3 = new Float64Array(3);       // barycentric scratch (caller-owned)
 
+// --- cluster index: a prebuilt spread pool + the charts per-group cadence ---
+// Groups of n in {8,16,32,64,128,256} are sliced from one 512-point spread pool
+// each cycle; every cycle builds a fresh handle, extracts a hull and a mid-alpha
+// shape into caller-owned buffers, then disposes -- the real outlines workload.
+const CLUSTER_MAXP = 256;
+const CLUSTER_POOL = 512;
+const CLUSTER_SIZES = [8, 16, 32, 64, 128, 256];
+const clusterPx = new Float32Array(CLUSTER_POOL);
+const clusterPy = new Float32Array(CLUSTER_POOL);
+for (let i = 0; i < CLUSTER_POOL; i++) { clusterPx[i] = rng() * 1000; clusterPy[i] = rng() * 1000; }
+const clusterOutI = new Int32Array(3 * CLUSTER_MAXP);   // 3n sizing bound
+const clusterOutE = new Int32Array(CLUSTER_MAXP);       // n sizing bound
+const CLUSTER_ALPHA = 60;  // mid alpha: keeps dense interior, drops far triangles
+
 // ---------------------------------------------------------------------------
 // leak tracker + kernels
 // ---------------------------------------------------------------------------
@@ -139,10 +153,19 @@ const fieldSlotWatch = [];
   fieldSlotWatch.push(h._slot);
   h.dispose();
 }
-// One growth kernel watches ALL THREE pools' HWM (the kernel name is unique per
+// Same pooling contract for the cluster index: one factory, slot HWM watched by
+// identity. A pool that leaked a slot per build would grow this unbounded.
+const clusterFactory = createClusterIndex(CLUSTER_MAXP);
+const clusterSlotWatch = [];
+{
+  const h = clusterFactory(clusterPx, clusterPy, CLUSTER_MAXP);
+  clusterSlotWatch.push(h._slot);
+  h.dispose();
+}
+// One growth kernel watches ALL FOUR pools' HWM (the kernel name is unique per
 // registration, so every collection rides a single registration).
 tracker.registerKernel(createCollectionGrowthKernel({
-  collections: [slotWatch, cellSlotWatch, fieldSlotWatch],
+  collections: [slotWatch, cellSlotWatch, fieldSlotWatch, clusterSlotWatch],
   window: 8,
   minSamples: 4,
 }));
@@ -225,11 +248,72 @@ for (let i = 0; i < FIELD_CYCLES; i++) {
   dispose();
 }
 
+// ---------------------------------------------------------------------------
+// phase 5: cluster-index per-group rebuild storm -- the charts outlines cadence.
+// Group sizes n in {8,16,32,64,128,256} sliced from the prebuilt pool; each
+// cycle builds a fresh handle, walks convexHull + a mid-alpha alphaShape into
+// caller-owned 3n/n buffers, then disposes.
+//
+// Per the torture-harness rule ("retention and allocation are two different
+// jobs -- do not mix them"), the storm is TWO sub-loops:
+//   5a RETENTION: effect + lite-leak track (slot released every cycle -> size()
+//      returns to 0, pool HWM flat). The tracker/effect churn itself allocates,
+//      so this half is NOT gc-gated -- identical idiom to phases 1c/1d.
+//   5b ALLOCATION: the identical build/query/dispose churn with NO tracker/effect
+//      overhead, under its OWN GcProfiler window. The build allocates exactly one
+//      ~48 B facade and the pooled arenas must not grow -> major=0.
+// ---------------------------------------------------------------------------
+for (let i = 0; i < CYCLES; i++) {
+  const dispose = effect(() => {
+    const cn = CLUSTER_SIZES[i % CLUSTER_SIZES.length];
+    const handle = clusterFactory(clusterPx, clusterPy, cn);
+    const slot = handle._slot;
+    let known = false;
+    for (let s = 0; s < clusterSlotWatch.length; s++) {
+      if (clusterSlotWatch[s] === slot) { known = true; break; }
+    }
+    if (!known) clusterSlotWatch.push(slot);
+    // Exercise both query paths each cycle into fixed caller-owned buffers.
+    handle.convexHull(clusterOutI);
+    handle.alphaShape(CLUSTER_ALPHA, clusterOutI, clusterOutE);
+    const gen = handle._gen | 0;  // detached primitive, never the handle
+    tracker.track(handle, () => { void gen; }, 'cluster', { audit: true });
+    handle.dispose();
+  });
+  dispose();
+}
+
+// Read the retention verdict NOW, before opening the allocation window: reading
+// size()/audit() after a gc + settle drains the leak tracker's pending
+// FinalizationRegistry work for phases 1/1c/1d/5a. If that deferred finalization
+// were left to fire inside 5b's window it would trigger a spurious major GC that
+// has nothing to do with the library. A second gc + settle flushes the tail.
 globalThis.gc?.();
 await new Promise((r) => setTimeout(r, 50));
-
 const live = tracker.size();
 const findings = tracker.audit();
+globalThis.gc?.();
+await new Promise((r) => setTimeout(r, 30));
+
+// 5b: the same churn with zero harness overhead, gated to major=0. The build
+// allocates exactly one ~48 B facade per cycle (young-gen, scavenged); the
+// pooled arenas and cluster arrays never grow.
+const gcCluster = new GcProfiler().start();
+for (let i = 0; i < CYCLES; i++) {
+  const cn = CLUSTER_SIZES[i % CLUSTER_SIZES.length];
+  const handle = clusterFactory(clusterPx, clusterPy, cn);
+  handle.convexHull(clusterOutI);
+  handle.alphaShape(CLUSTER_ALPHA, clusterOutI, clusterOutE);
+  handle.dispose();
+  if ((i & 511) === 0) {
+    gcCluster.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+  }
+}
+
+await new Promise((r) => setTimeout(r, 50));
+const sClusterStorm = gcCluster.summary();
+const reportClusterStorm = checkNoGc(sClusterStorm, { maxMajor: 0, maxPauseMs: 4 });
+gcCluster.stop();
 
 // ---------------------------------------------------------------------------
 // phase 2: allocation + GC torture (steady-state handle, stepped queries)
@@ -331,11 +415,58 @@ const reportField = checkNoGc(sField, { maxMajor: 0, maxPauseMs: 4 });
 gcField.stop();
 
 // ---------------------------------------------------------------------------
+// phase 6: cluster-index steady-state -- ONE build at n=2000, ~100k alternating
+// convexHull / alphaShape calls sweeping alpha over a precomputed table (no
+// per-call math beyond the sweep index). Pooled out buffers allocated once
+// outside the loop. Every call must be 0 B (major=0).
+// ---------------------------------------------------------------------------
+const CLUSTER_HOT = 100000;
+const CLUSTER_STEADY_N = 2000;
+const steadyPx = new Float32Array(CLUSTER_STEADY_N);
+const steadyPy = new Float32Array(CLUSTER_STEADY_N);
+for (let i = 0; i < CLUSTER_STEADY_N; i++) { steadyPx[i] = rng() * 1000; steadyPy[i] = rng() * 1000; }
+const steadyOutI = new Int32Array(3 * CLUSTER_STEADY_N);
+const steadyOutE = new Int32Array(CLUSTER_STEADY_N);
+const ALPHA_SWEEP = new Float64Array(256);
+for (let i = 0; i < ALPHA_SWEEP.length; i++) ALPHA_SWEEP[i] = 8 + i * 2;  // 8..518
+
+const gcClusterSteady = new GcProfiler().start();
+const clusterSteadyFactory = createClusterIndex(CLUSTER_STEADY_N);
+const clusterSteady = clusterSteadyFactory(steadyPx, steadyPy, CLUSTER_STEADY_N);  // built ONCE
+for (let i = 0; i < CLUSTER_HOT; i++) {
+  if ((i & 1) === 0) {
+    clusterSteady.convexHull(steadyOutI);
+  } else {
+    clusterSteady.alphaShape(ALPHA_SWEEP[(i >>> 1) & 255], steadyOutI, steadyOutE);
+  }
+  if ((i & 8191) === 0) {
+    gcClusterSteady.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+  }
+}
+clusterSteady.dispose();
+
+await new Promise((r) => setTimeout(r, 50));
+const sClusterSteady = gcClusterSteady.summary();
+const reportClusterSteady = checkNoGc(sClusterSteady, { maxMajor: 0, maxPauseMs: 4 });
+gcClusterSteady.stop();
+
+// Fold both cluster windows into one reportCluster / summary for the gate line.
+const reportCluster = { ok: reportClusterStorm.ok && reportClusterSteady.ok };
+const sCluster = {
+  gc: {
+    major: sClusterStorm.gc.major + sClusterSteady.gc.major,
+    minor: sClusterStorm.gc.minor + sClusterSteady.gc.minor,
+    maxMs: Math.max(sClusterStorm.gc.maxMs, sClusterSteady.gc.maxMs),
+  },
+};
+
+// ---------------------------------------------------------------------------
 // gate
 // ---------------------------------------------------------------------------
 const ok = report.ok &&
   reportCell.ok &&
   reportField.ok &&
+  reportCluster.ok &&
   live === 0 &&
   leaks.length === 0 &&
   findings.length === 0 &&
@@ -350,6 +481,8 @@ console.log(
   ' maxMs=' + sCell.gc.maxMs.toFixed(2) +
   ' | field major=' + sField.gc.major + ' minor=' + sField.gc.minor +
   ' maxMs=' + sField.gc.maxMs.toFixed(2) +
+  ' | cluster major=' + sCluster.gc.major + ' minor=' + sCluster.gc.minor +
+  ' maxMs=' + sCluster.gc.maxMs.toFixed(2) +
   ' | rebuild=' + rebuildBytes + ' bytes | ' + (ok ? 'ok' : 'FAIL')
 );
 
@@ -362,6 +495,12 @@ if (!ok) {
   }
   for (const v of reportField.violations) {
     console.error('  field-violation ' + v.metric + ' limit=' + v.limit + ' actual=' + v.actual);
+  }
+  for (const v of reportClusterStorm.violations) {
+    console.error('  cluster-storm-violation ' + v.metric + ' limit=' + v.limit + ' actual=' + v.actual);
+  }
+  for (const v of reportClusterSteady.violations) {
+    console.error('  cluster-steady-violation ' + v.metric + ' limit=' + v.limit + ' actual=' + v.actual);
   }
   for (const f of findings) console.error('  finding ' + f.kind + ':' + (f.reason || ''));
   for (const l of leaks) console.error('  leak ' + l);

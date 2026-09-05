@@ -1,6 +1,6 @@
 # @zakkster/lite-delaunay
 
-Version: 1.3.0
+Version: 1.4.0
 
 > Zero-GC 2D Delaunay triangulation. Pre-allocated arena, sweepline algorithm,
 > half-edge mesh output. Built for per-frame use in games and simulations
@@ -62,9 +62,12 @@ For every `e` where `halfedges[e] !== -1`: `halfedges[halfedges[e]] === e`.
 
 ## Winding
 
-Triangles are output in **counter-clockwise winding in math coordinates**
-(Y-up). In screen-space (Y-down) this looks clockwise. Same convention as
-Mapbox Delaunator.
+Triangles are output in **clockwise winding in math coordinates** (Y-up).
+In screen-space (Y-down) this reads counter-clockwise. Same convention as
+Mapbox Delaunator (verified input-for-input against it). The cluster index
+emits its hull and outer boundary loops in this same native sense --
+counter-clockwise on screen, clockwise in math Y-up -- with hole loops
+opposite; see the cluster section.
 
 ## Degenerate inputs
 
@@ -377,16 +380,18 @@ get `NaN`; a degenerate build fills the whole `gridW*gridH` prefix with `NaN` an
 returns `0`. A pixel-space consumer flips rows itself and derives any present-mask
 itself, on its own cold path.
 
-### Canonical usage: reserved lite-charts wiring
+### Canonical usage: the lite-charts field layer
 
 ```js
 import { createFieldIndex } from "@zakkster/lite-delaunay";
 
 const chart = createScatterChart({
   data,
-  // RESERVED future wiring (a heatmap / contour layer). The outer `field:` key
-  // is reserved and NOT YET CONSUMED -- charts will wire it via a future brief.
-  field: { index: createFieldIndex(20_000) },
+  // CONSUMED: lite-charts 1.16.0 rasterizes this into its scatter heatmap
+  // (sampleField, batched cold per refresh) and 1.17.0 draws contour isolines
+  // over it (triangleCount + triangleVertices). locate/barycentric are not yet
+  // consumed by charts but are frozen surface (semver).
+  field: { index: createFieldIndex(20_000), value: "temperature" },
 });
 ```
 
@@ -434,6 +439,140 @@ than the cell slot).
   integers, `outGrid` the wrong type or too short, or the bbox non-finite or not
   strictly ordered (`bx0 < bx1`, `by0 < by1`)
 - Out-of-range / NaN queries are VALUES (`-1` / `NaN`), never throws.
+
+## Cluster index (v1.4.0)
+
+A fifth export, `createClusterIndex`, is the boundary-extraction capability:
+convex hulls and concave alpha-shape outlines over a point group, built for the
+lite-charts `outlines` layer (one outline per point group, rebuilt per group per
+refresh). The alpha shape is derived FROM the Delaunay triangulation -- keep
+every triangle whose circumradius is <= alpha, then trace the edges owned by
+exactly one kept triangle into closed loops -- knowledge only the mesh has. The
+convex hull is the alpha -> +Infinity degenerate, answered directly from the
+triangulator's own ordered hull ring in O(h).
+
+```ts
+const createClusterIndex: (maxPoints: number) => ClusterIndexFactory;
+
+type ClusterIndexFactory = (pxs, pys, n) => ClusterIndex;  // Float32Array, NaN legal
+
+interface ClusterIndex {
+  // Ordered convex hull as ORIGINAL site indices. Degenerate build (n < 3,
+  // collinear, all-duplicate) -> 0, not a throw. count <= n. 0 B/call.
+  convexHull(outIndices: Int32Array): number;
+  // Alpha-shape boundary loops. alpha is a RADIUS in input units; keep
+  // triangles with circumradius <= alpha. Loops are CONCATENATED into
+  // outIndices (ORIGINAL indices, implicit closure last -> first);
+  // outLoopEnds[i] = EXCLUSIVE end offset of loop i. Returns the loop count;
+  // 0 is legal (alpha keeps nothing, or degenerate build). 0 B/call.
+  alphaShape(alpha: number, outIndices: Int32Array, outLoopEnds: Int32Array): number;
+  dispose(): void;
+}
+```
+
+### Sizing bounds (pre-allocate against these)
+
+A planar triangulation of n points has at most `3n - 6` edges, and every
+`outIndices` entry corresponds to exactly one boundary EDGE, so:
+
+- `outIndices` for `alphaShape`: tight bound `3n - 6`, safe recommendation `3n`.
+  A pinch-point vertex appearing on more than one loop is already covered --
+  entries count edges, never vertices.
+- `outLoopEnds`: every loop has >= 3 edges, so tight `n - 2`, safe `n`.
+- `outIndices` for `convexHull`: hull size h <= n; bound `n`.
+
+Both methods COUNT first and validate the caller's buffers against the exact
+totals BEFORE writing a single element (validate-before-write) -- an
+exactly-3n / n caller can never trip the short-buffer throw, and a throwing
+call never leaves a partial write.
+
+### Loops, holes, orientation
+
+Multiple disjoint loops are the semantic point: two sub-clusters bridged by a
+long edge split into two loops at the right alpha. Interior HOLE loops are
+emitted too (a kept annulus yields its inner rim as its own loop). The
+ABSOLUTE orientation convention, stated in both senses: outer loops and the
+convex hull are emitted counter-clockwise in SCREEN coordinates (+y down),
+which is clockwise in math coordinates (+y up); hole loops wind OPPOSITE.
+The invariant a renderer can rely on: outer and hole loops always wind
+oppositely, and `convexHull` matches the outer sense exactly (a large FINITE
+alpha degenerates alphaShape to the convex hull -- same vertices, same sense;
+`Infinity` itself is refused, see throws).
+
+### Duplicate coordinates
+
+When coincident points share a boundary vertex, the emitted ORIGINAL index is
+the sweep-order-FIRST duplicate (the triangulator sorts by distance from the
+seed circumcenter and EPSILON-skips adjacent coincident points). Deterministic
+for identical input arrays; NOT guaranteed to be the lowest index; may change
+if the input order changes. Documented behavior, not a promise of cleverness.
+
+### Fail-closed list
+
+- A triangle degenerate at the f64 NOISE FLOOR (relative-area guard
+  `|D| <= EPSILON*scale`, shared with the cell index) gets `NaN` circumradius
+  at build; `NaN <= alphaSq` is false, so it can NEVER be kept at any alpha.
+  A merely THIN triangle is above that floor and keeps honest semantics: a
+  huge-but-finite circumradius, kept only by a correspondingly huge alpha.
+- Degenerate build (n < 3, all-collinear, all-coincident): both methods
+  return 0 -- a value, not an error.
+- The alpha door refuses `null`, `undefined`, `NaN`, `+0`, `-0`, negatives,
+  `Infinity`, `-Infinity`, and non-numbers BEFORE any arithmetic touches the
+  value. Infinity is NOT a hull alias -- call `convexHull` for the hull.
+- Both boundary walks are step-capped and throw on overrun rather than spin.
+- Non-finite input points are compacted out at build, exactly like the field
+  index -- they can never appear in any loop.
+
+### Pool / dispose semantics
+
+Identical to `createCellIndex` / `createFieldIndex`: one factory serves many
+concurrent live handles (one per group), each build acquires a pooled slot and
+each `dispose()` returns it, a new slot is allocated only at a new concurrent
+high-water mark, and a build allocates exactly one ~48 B generation-stamped
+facade -- 0 B beyond it, and every query is 0 B. Using or double-disposing a
+disposed handle THROWS; a stale handle onto a rebuilt slot THROWS.
+
+### Memory
+
+Per-slot memory is `~116*maxPoints` bytes + 16 KB: the field slot minus the
+z-gather buffer, plus the per-triangle circumradius^2 array, the keep flags,
+and the per-halfedge visited marks. No circumcenters are stored -- only radii.
+
+### Performance (same rig as the core table)
+
+Warm rebuild: 0.21 ms at 1k, 3.0 ms at 10k, 32.3 ms at 100k points (mesh
+build dominates, same as the field index). `convexHull`: 13.9-34.7 Mq/s
+(O(h) ring walk). `alphaShape`: O(T) per call -- 44.1k q/s at 1k points,
+4.5k at 10k, 0.5k at 100k. The consumer-shaped number -- one full per-group
+cycle `build -> convexHull -> alphaShape -> dispose` -- runs 0.72 us at n=8,
+3.6 us at n=32, 7.8 us at n=64, 34.8 us at n=256: even 64 groups per refresh
+cost well under a millisecond.
+
+### Canonical usage: the lite-charts outlines layer
+
+```js
+import { createClusterIndex } from "@zakkster/lite-delaunay";
+
+const chart = createScatterChart({
+  data,
+  // lite-charts v1.18.0 consumer (brief cluster-outlines.md). Charts packs
+  // each group's pxs/pys and calls the factory once per group per refresh:
+  // convexHull when `alpha` is absent, alphaShape when it is set.
+  outlines: { index: createClusterIndex(20_000), groupKey: "zone", alpha: 25 },
+});
+```
+
+### Throws
+
+- `createClusterIndex(x)` with x not a non-negative integer
+- `factory(pxs, pys, n)` with `n > maxPoints`, `n` not a non-negative integer,
+  missing `pxs`/`pys`, or arrays shorter than `n`
+- any method on a disposed or stale handle; `dispose` double-dispose
+- `alphaShape` with `alpha` not a finite number > 0 (Infinity included)
+- either out buffer not an `Int32Array`, or shorter than the counted need
+  (checked before any write)
+- boundary / ring walk overrunning its step cap (degenerate-mesh guard)
+- Degenerate builds and empty keep-sets are VALUES (`0`), never throws.
 
 ## Anti-patterns to avoid
 

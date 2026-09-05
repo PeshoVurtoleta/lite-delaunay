@@ -450,3 +450,94 @@ export type FieldIndexFactory = (
  * @throws if `maxPoints` is not a non-negative integer.
  */
 export function createFieldIndex(maxPoints: number): FieldIndexFactory;
+
+/**
+ * A per-build cluster-index handle: boundary extraction (convex hull +
+ * alpha-shape outlines) over one point group, built by a
+ * {@link ClusterIndexFactory}. Built fresh per group per refresh by the
+ * lite-charts `outlines` layer. All emitted indices are ORIGINAL site indices.
+ *
+ * Winding (the absolute convention, both senses): outer loops and the convex
+ * hull are emitted counter-clockwise in SCREEN coordinates (+y down) =
+ * clockwise in math coordinates (+y up); interior hole loops wind OPPOSITE;
+ * outer and hole loops always wind oppositely.
+ */
+export interface ClusterIndex {
+    /**
+     * Write the ordered convex hull into `outIndices` and return the vertex
+     * count `h` (`<= n`). A degenerate build (n < 3, collinear, all-duplicate)
+     * returns `0` -- a value, not a throw. Validates `outIndices.length >= h`
+     * BEFORE writing anything. Zero allocation.
+     *
+     * @param outIndices caller-owned `Int32Array`, safe bound `n`
+     * @throws if the handle is disposed/stale, `outIndices` is not an
+     *   `Int32Array`, or it is shorter than the counted hull
+     */
+    convexHull(outIndices: Int32Array): number;
+
+    /**
+     * Extract the alpha-shape boundary and return the loop count. Keeps every
+     * triangle whose circumradius is `<= alpha` (`alpha` is a RADIUS in input
+     * units); the boundary is the set of edges owned by exactly one kept
+     * triangle, traced into closed loops. Loops are CONCATENATED into
+     * `outIndices` (implicit closure last -> first); `outLoopEnds[i]` is the
+     * EXCLUSIVE end offset of loop i. `0` loops is legal (alpha keeps nothing,
+     * or a degenerate build). Interior hole loops are emitted (see the
+     * interface doc for orientation). A triangle degenerate at the f64 noise
+     * floor carries `NaN` circumradius and can never be kept (a merely thin
+     * triangle keeps its honest huge-but-finite circumradius). Counts first and
+     * validates BOTH buffers against the exact totals BEFORE writing (a
+     * `3n` / `n`-sized caller can never trip the short-buffer throw). A large
+     * FINITE alpha lawfully degenerates to the convex hull; `Infinity` itself
+     * throws. Zero allocation.
+     *
+     * @param alpha finite radius > 0 in input units
+     * @param outIndices caller-owned `Int32Array`, tight bound `3n - 6`, safe `3n`
+     * @param outLoopEnds caller-owned `Int32Array`, tight bound `n - 2`, safe `n`
+     * @throws if the handle is disposed/stale; `alpha` is not a finite number
+     *   > 0 (`NaN`, `+/-0`, negatives, `Infinity` all refused); either buffer
+     *   is not an `Int32Array` or is shorter than the counted need; or a
+     *   boundary walk overruns its step cap
+     */
+    alphaShape(alpha: number, outIndices: Int32Array, outLoopEnds: Int32Array): number;
+
+    /**
+     * Release the handle and return its pooled slot to the factory. Any later
+     * use of this handle (or any other facade of the same build) THROWS;
+     * double-dispose THROWS.
+     */
+    dispose(): void;
+}
+
+/**
+ * Builds a {@link ClusterIndex} over the SoA coordinates `pxs` / `pys` (the
+ * first `n` entries of each; `NaN`/`Infinity` legal, compacted out at build).
+ * `n` must be `<= maxPoints` (throws otherwise). A build allocates one small
+ * handle facade (~48 B, minor-GC-collectible); the mesh arena, scratch, index
+ * maps and cluster arrays are pooled -- 0 B beyond the facade.
+ */
+export type ClusterIndexFactory = (
+    pxs: ArrayLike<number>,
+    pys: ArrayLike<number>,
+    n: number
+) => ClusterIndex;
+
+/**
+ * Create a pooled cluster-index factory sized for up to `maxPoints` points.
+ *
+ * Mirrors {@link createFieldIndex} exactly (pooled factory-factory, SoA input,
+ * NaN compaction, ORIGINAL indices, generation-stamped facades) but its surface
+ * is boundary extraction: `convexHull` (the triangulator's own ordered hull
+ * ring, O(h)) and `alphaShape` (keep circumradius <= alpha, trace the boundary
+ * into concatenated loops). Sizing bounds for caller-owned buffers: `outIndices`
+ * tight `3n - 6` / safe `3n`; `outLoopEnds` tight `n - 2` / safe `n`;
+ * `convexHull` bound `n`. A build allocates one small handle facade (~48 B);
+ * everything else is pooled and every query is 0 B. A new slot is allocated only
+ * at a new concurrent high-water mark. Per-slot memory is `~116*maxPoints`
+ * bytes + 16 KB (circumradii only, no circumcenters).
+ *
+ * @param maxPoints hard upper bound on `n` per build. Must be a non-negative
+ *   integer.
+ * @throws if `maxPoints` is not a non-negative integer.
+ */
+export function createClusterIndex(maxPoints: number): ClusterIndexFactory;

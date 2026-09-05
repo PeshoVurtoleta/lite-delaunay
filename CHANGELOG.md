@@ -3,6 +3,74 @@
 All notable changes to `@zakkster/lite-delaunay` are documented here. The format
 is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [1.4.0] - 2026-09-05
+
+### Added
+
+- `createClusterIndex(maxPoints)` -- a pooled cluster-index factory (0 B/query;
+  ~48 B facade per build) for boundary extraction over a point group: the convex
+  hull and concave alpha-shape outlines. The returned function
+  `(pxs, pys, n) -> ClusterIndex` triangulates the Delaunay mesh once (reusing
+  the field index's build path verbatim) and precomputes per-triangle
+  circumradius^2; the handle exposes `convexHull`, `alphaShape` and `dispose`.
+  Built against the lite-charts consumer-contract brief `cluster-outlines.md`
+  (the charts v1.18.0 `outlines` layer, one factory build per point group per
+  refresh).
+- `convexHull(outIndices) -> count`: the ordered hull as ORIGINAL site indices,
+  read from the triangulator's own hull ring in O(h). Degenerate build (n < 3,
+  collinear, all-duplicate) returns 0. Buffer bound: n.
+- `alphaShape(alpha, outIndices, outLoopEnds) -> loopCount`: keep every triangle
+  with circumradius <= `alpha` (a RADIUS in input units); the boundary -- edges
+  owned by exactly one kept triangle -- is traced into loops CONCATENATED in
+  `outIndices` (ORIGINAL indices, implicit closure), with `outLoopEnds[i]` the
+  EXCLUSIVE end offset of loop i. Interior hole loops are emitted. Orientation:
+  outer loops and `convexHull` are counter-clockwise in screen coordinates
+  (+y down) = clockwise in math (+y up); holes wind opposite. Sizing bounds:
+  `outIndices` tight 3n-6 / safe 3n, `outLoopEnds` tight n-2 / safe n. Both
+  methods count first and validate the exact need BEFORE writing anything.
+  0 loops is legal; `Infinity` alpha throws (a large finite alpha lawfully
+  degenerates to the hull); a triangle degenerate at the f64 noise floor
+  (|D| <= EPSILON*scale) carries NaN circumradius and is never kept.
+- Coincident-duplicate determinism, documented: the emitted ORIGINAL index is
+  the sweep-order-first duplicate -- deterministic for identical input arrays,
+  not guaranteed lowest.
+- Pooling identical to `createCellIndex`/`createFieldIndex`: HWM slots,
+  generation-stamped facades, stale/double-dispose throws. Per-slot memory
+  ~116*maxPoints bytes + 16 KB (circumradii only, no circumcenters).
+- Measured (Node 22, Apple-Silicon-class): full per-group cycle
+  `build -> convexHull -> alphaShape -> dispose` 0.72 us at n=8, 7.76 us at
+  n=64, 34.8 us at n=256; `convexHull` 13.9-34.7 Mq/s; `alphaShape` O(T)/call
+  (44.1k q/s at 1k points, 0.5k at 100k); warm rebuild 32.3 ms at 100k.
+- Tests: +21 (`test/ClusterIndex.test.js`, with an independent monotone-chain
+  hull oracle and an independent circumradius-filter boundary oracle) -> 148
+  total. Torture: two new cluster phases (per-group rebuild storm at
+  n=8..256 and a 100k-query steady state), gated at major=0/maxPauseMs=4;
+  measured cluster major=0 minor=0. `bench/bench.js` gained phases for all
+  four index surfaces (spatial/cell/field post-1.3.0, cluster this cycle).
+
+### Fixed
+
+- Winding documentation was BACKWARDS: llms.txt "## Winding" and three README
+  passages claimed counter-clockwise in math coordinates (Y-up). Measured
+  reality on every input -- and byte-identical behaviour to Mapbox Delaunator
+  on the same clouds -- is CLOCKWISE in math coordinates, which reads
+  counter-clockwise in screen space. No code change; the docs now state the
+  measured convention.
+- Stale field-consumption claims: llms.txt and the `createFieldIndex` JSDoc
+  still called the charts `field:` wiring "reserved -- not yet consumed";
+  charts 1.16.0 consumes `sampleField` and 1.17.0 consumes
+  `triangleCount`/`triangleVertices`. The docs now state the consumed reality
+  (`locate`/`barycentric` remain unconsumed but frozen surface).
+- README "no deduplication" wording tightened: EPSILON-coincident duplicates
+  are skipped by the sweep and own no triangles; indices are still never
+  renumbered.
+
+### Changed
+
+- `package.json` test script runs `test/ClusterIndex.test.js` with the other
+  node:test suites. No dependency changes; no changes to any shipped export's
+  shape or semantics (additive-only release).
+
 ## [1.3.0] - 2026-09-03
 
 ### Added

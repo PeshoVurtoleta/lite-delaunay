@@ -4,6 +4,7 @@ import {
     createSpatialIndex,
     createCellIndex,
     createFieldIndex,
+    createClusterIndex,
 } from "../Delaunay.js";
 
 function makePoints(n, seed = 1) {
@@ -280,6 +281,106 @@ console.log("n\t\trebuild ms\tdrift Mq/s\tjump Mq/s\tgrid Mcells/s\theap d (KB)"
 for (const n of IDX_SIZES) {
     const r = benchFieldIdx(n);
     console.log(`${r.n}\t\t${r.buildMs}\t\t${r.coherent}\t\t${r.random}\t\t${r.gridCells}\t\t${r.heapDelta}`);
+}
+
+function benchClusterIdx(n) {
+    const { pxs, pys } = makeSoA(n, n ^ 0x1b873593);
+    const factory = createClusterIndex(n);
+    const buildMs = benchWarmBuild(factory, pxs, pys, n);
+    const h = factory(pxs, pys, n);
+
+    // Caller-owned buffers at the documented safe bounds (3n / n).
+    const outI = new Int32Array(3 * n);
+    const outE = new Int32Array(n);
+    // Alpha ~ 3x the mean point spacing of the 1000x1000 cloud: keeps the dense
+    // interior, drops sliver fringe -- the realistic outline setting.
+    const alpha = 3 * (1000 / Math.sqrt(n));
+
+    const runHull = (ops) => {
+        let acc = 0;
+        for (let q = 0; q < ops; q++) acc += h.convexHull(outI);
+        sink += acc;
+    };
+    const runAlpha = (ops) => {
+        let acc = 0;
+        for (let q = 0; q < ops; q++) acc += h.alphaShape(alpha, outI, outE);
+        sink += acc;
+    };
+
+    // convexHull is O(h); alphaShape is O(T) per call -- scale the batch so each
+    // timed run stays in a reliable-milliseconds regime.
+    const alphaOps = n <= 1000 ? 20000 : n <= 10000 ? 2000 : 200;
+
+    if (global.gc) global.gc();
+    const heapBefore = process.memoryUsage().heapUsed;
+    const hullPerSec = timeOps(runHull, 200000);
+    const alphaPerSec = timeOps(runAlpha, alphaOps);
+    if (global.gc) global.gc();
+    const heapDelta = ((process.memoryUsage().heapUsed - heapBefore) / 1024).toFixed(1);
+
+    h.dispose();
+    return {
+        n,
+        buildMs: buildMs.toFixed(3),
+        hull: (hullPerSec / 1e6).toFixed(2),
+        alphaShape: alphaPerSec >= 1e6 ? (alphaPerSec / 1e6).toFixed(2) : (alphaPerSec / 1e3).toFixed(1) + "k",
+        heapDelta,
+    };
+}
+
+// The charts per-refresh unit: ONE factory sized for the largest group, then
+// per group build -> convexHull -> alphaShape -> dispose, fresh every refresh.
+function benchClusterCycle(n, factory, poolPx, poolPy) {
+    const outI = new Int32Array(3 * n);
+    const outE = new Int32Array(n);
+    const alpha = 2.5 * (1000 / Math.sqrt(n));
+
+    const run = (ops) => {
+        let acc = 0;
+        for (let q = 0; q < ops; q++) {
+            const handle = factory(poolPx, poolPy, n);
+            acc += handle.convexHull(outI);
+            acc += handle.alphaShape(alpha, outI, outE);
+            handle.dispose();
+        }
+        sink += acc;
+    };
+
+    const ops = n <= 64 ? 20000 : 10000;
+    if (global.gc) global.gc();
+    const heapBefore = process.memoryUsage().heapUsed;
+    const cyclesPerSec = timeOps(run, ops);
+    if (global.gc) global.gc();
+    const heapDelta = ((process.memoryUsage().heapUsed - heapBefore) / 1024).toFixed(1);
+
+    return {
+        n,
+        usPerCycle: (1e6 / cyclesPerSec).toFixed(2),
+        cyclesPerSec: (cyclesPerSec / 1e3).toFixed(1) + "k",
+        heapDelta,
+    };
+}
+
+console.log("\ncreateClusterIndex -- warm rebuild + convexHull / alphaShape queries");
+console.log("-".repeat(80));
+console.log("n\t\trebuild ms\thull Mq/s\talphaShape q/s\theap d (KB)");
+for (const n of IDX_SIZES) {
+    const r = benchClusterIdx(n);
+    console.log(`${r.n}\t\t${r.buildMs}\t\t${r.hull}\t\t${r.alphaShape}\t\t${r.heapDelta}`);
+}
+
+console.log("\ncreateClusterIndex -- small-n full cycle (build -> hull -> alpha -> dispose)");
+console.log("-".repeat(80));
+console.log("n\t\tus/cycle\tcycles/s\theap d (KB)\t<- charts' per-group refresh unit");
+{
+    const CYCLE_MAX = 256;
+    const { pxs, pys } = makeSoA(CYCLE_MAX, 0x85ebca6b);
+    const cycleFactory = createClusterIndex(CYCLE_MAX);
+    cycleFactory(pxs, pys, CYCLE_MAX).dispose(); // reach the pool high-water mark
+    for (const n of [8, 16, 32, 64, 128, 256]) {
+        const r = benchClusterCycle(n, cycleFactory, pxs, pys);
+        console.log(`${r.n}\t\t${r.usPerCycle}\t\t${r.cyclesPerSec}\t\t${r.heapDelta}`);
+    }
 }
 
 // A read of sink keeps every query loop observable -- V8 cannot elide them.

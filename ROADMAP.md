@@ -151,14 +151,30 @@ walk; the remembering visibility walk here is NEW code written for 1.3.0.
 - Natural-neighbor interpolation stays explicitly OUT (needs per-query virtual
   insertion; revisit only with a measured need).
 
-## v1.4.0 -- hulls and outlines (unlocks: cluster overlays on scatter)
+## v1.4.0 -- SHIPPED: createClusterIndex (hulls + alpha-shape outlines)
 
-- `convexHull(outIndices) -> count` -- read off the halfedges === -1 boundary,
-  ordered; free given the mesh.
-- `alphaShape(alpha, outIndices) -> count` -- concave outline by dropping
-  triangles with circumradius > 1/alpha, then boundary extraction. Enables
-  cluster-outline annotations in lite-charts (feed the polygon straight into
-  the v1.7.0 annotation layer as a range/point overlay set).
+Cut against the consumer-contract brief `LiteCharts/briefs/cluster-outlines.md`
+(charts v1.18.0 `outlines` layer -- the fourth rung of the injection ladder;
+charts consumes the PUBLISHED package, one factory build per point group per
+refresh). The brief superseded this section's original sketch on every point
+it touched:
+
+- `alphaShape(alpha, outIndices, outLoopEnds) -> loopCount` -- alpha is a
+  RADIUS in input units (the sketch's "circumradius > 1/alpha" reciprocal was
+  WRONG); keep triangles with circumradius <= alpha; boundary loops are
+  CONCATENATED with exclusive end offsets in `outLoopEnds` (a single flat
+  count cannot express the multiple disjoint loops that are the semantic
+  point). Interior hole loops are emitted; outer and hole loops always wind
+  oppositely (outer = screen-CCW / math-CW, the mesh's native sense).
+- `convexHull(outIndices) -> count` -- walks the triangulator's own ordered
+  hull ring in O(h), not the sketch's `halfedges === -1` scan (same answer,
+  strictly less work). Rides along as the alpha -> infinity degenerate
+  (`Infinity` itself throws; a large FINITE alpha degenerates lawfully).
+- Sizing bounds shipped to the consumer: `outIndices` tight `3n - 6` / safe
+  `3n`; `outLoopEnds` tight `n - 2` / safe `n`; hull bound `n`. Degenerate
+  triangles carry NaN circumradius and are never kept (fail closed).
+- Charts draws the loops in its own scene node (stroke + optional fill); the
+  sketch's feed-the-v1.7.0-annotation-layer idea did not survive the brief.
 
 ## Explicitly NOT planned
 

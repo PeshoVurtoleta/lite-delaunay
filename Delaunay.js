@@ -36,7 +36,7 @@
  * are bumped in the same commit or not at all (packaging law).
  * @type {string}
  */
-export const VERSION = "1.3.0";
+export const VERSION = "1.4.0";
 
 // IEEE 754 double machine-epsilon. Used for the near-duplicate-point skip
 // in the advancing-front loop (matches Mapbox Delaunator's tolerance).
@@ -2123,12 +2123,13 @@ function _buildFieldSlot(slot, pxs, pys, n) {
  * A new slot is allocated only at a new concurrent high-water mark.
  *
  * @example
- * // RESERVED future lite-charts wiring (a heatmap / contour layer). The outer
- * // `field:` key is reserved and NOT YET CONSUMED -- charts will wire it via a
- * // future brief. Do not treat this output as feeding any charts kernel today.
+ * // CONSUMED lite-charts wiring: charts 1.16.0 rasterizes this into its
+ * // scatter heatmap (sampleField, batched cold per refresh) and 1.17.0 draws
+ * // contour isolines over it (triangleCount + triangleVertices). locate and
+ * // barycentric are not yet consumed by charts but are frozen surface (semver).
  * const chart = createScatterChart({
  *   data,
- *   field: { index: createFieldIndex(20_000) }, // reserved -- not yet consumed
+ *   field: { index: createFieldIndex(20_000), value: "temperature" },
  * });
  *
  * @param {number} maxPoints hard upper bound on `n` per build. Must be a
@@ -2167,6 +2168,497 @@ export const createFieldIndex = (maxPoints) => {
         // slot is now stale and will throw.
         slot.gen++;
         const facade = Object.create(FIELD_FACADE_PROTO);
+        facade._slot = slot;
+        facade._gen = slot.gen;
+        return facade;
+    };
+};
+
+// ===========================================================================
+// Cluster index (v1.4.0) -- convex hull + alpha-shape cluster outlines.
+// ===========================================================================
+//
+// `createClusterIndex(maxPoints)` returns a BUILD function
+// `(pxs, pys, n) -> clusterIndex` that triangulates the Delaunay mesh once and
+// then answers two boundary-extraction queries against it:
+//
+//   - `convexHull(outIndices)` walks the triangulator's own hull ring and emits
+//     the ordered hull as ORIGINAL site indices. This is the alpha -> +Infinity
+//     degenerate of the alpha shape, computed directly from the ring in O(h).
+//   - `alphaShape(alpha, outIndices, outLoopEnds)` keeps every triangle whose
+//     circumradius is <= alpha, then traces the boundary (edges owned by exactly
+//     one kept triangle) into one or more CONCATENATED loops. `alpha` is a RADIUS
+//     in input (pixel) units. The two-buffer output expresses the multiple
+//     disjoint loops (and interior holes) a single flat count cannot.
+//
+// Pooling / facade / generation semantics are IDENTICAL to createFieldIndex and
+// createCellIndex: one factory, many concurrent handles; a build acquires a
+// pooled slot and bumps its generation stamp; dispose bumps it again and returns
+// the slot; a stale or disposed facade THROWS. A build allocates exactly one
+// small facade (~48 B, young-gen). Every query is 0 B. The slot is the field
+// slot MINUS the z-gather buffer PLUS three cluster arrays: per-triangle
+// circumradius^2 (`crSq`), the per-triangle keep flag (`kept`), and the
+// boundary-walk visited marks (`visited`).
+//
+// WINDING (the documented ABSOLUTE convention): the mesh is clockwise in math
+// coordinates (+y up), which reads counter-clockwise in screen coordinates
+// (+y down). Outer loops and the convex hull are emitted in that SAME sense
+// (screen-CCW / math-CW), interior hole loops in the OPPOSITE sense; outer and
+// hole loops therefore always wind oppositely. The emit rule is chosen ONCE per
+// call from `slot.orientSign` (measured winding), so the convention survives a
+// theoretically mirror-wound mesh without any per-edge branch.
+
+/**
+ * Cold error-message factory for the cluster index. All throw strings are built
+ * (and thrown) HERE, off every hot method body -- the guard CONDITIONS live in
+ * the methods, but not the byte cost of their messages.
+ *
+ * @param {string} code message selector
+ * @param {*} [a] first interpolated value
+ * @param {*} [b] second interpolated value
+ * @returns {never} always throws
+ */
+function _clusterThrow(code, a, b) {
+    switch (code) {
+        case 'maxp':
+            throw new Error(`lite-delaunay: maxPoints must be a non-negative integer, got ${a}`);
+        case 'n':
+            throw new Error(`lite-delaunay: n must be a non-negative integer, got ${a}`);
+        case 'nmax':
+            throw new Error(`lite-delaunay: n (${a}) exceeds cluster index max (${b})`);
+        case 'arr':
+            throw new Error("lite-delaunay: pxs and pys are required");
+        case 'arrlen':
+            throw new Error(`lite-delaunay: pxs/pys shorter than n (${a})`);
+        case 'disposed':
+            throw new Error(`lite-delaunay: ${a} called on a disposed cluster index`);
+        case 'ddispose':
+            throw new Error("lite-delaunay: dispose called on an already-disposed cluster index");
+        case 'alpha':
+            throw new Error(`lite-delaunay: alpha must be a finite number > 0, got ${a}`);
+        case 'outtype':
+            throw new Error(`lite-delaunay: ${a} must be an Int32Array`);
+        case 'outshort':
+            throw new Error(`lite-delaunay: ${a} too short (need length >= ${b})`);
+        case 'walk':
+            throw new Error("lite-delaunay: alpha-shape boundary walk exceeded its step cap (degenerate mesh)");
+        case 'ring':
+            throw new Error("lite-delaunay: convex-hull ring walk exceeded its step cap (degenerate hull)");
+        // Self-guarding: a mistyped code must fail CLOSED, never fall through
+        // to an undefined return.
+        default:
+            throw new Error(`lite-delaunay: internal error (unknown cluster throw code "${code}")`);
+    }
+}
+
+/**
+ * Precompute every triangle's circumradius^2 into the pooled `crSq`. Cold, once
+ * per build (only when the build is non-degenerate). Uses the SAME dx/dy/ex/ey/
+ * bl/cl/D/scale circumcenter math as the cell circumcenter guard, but on the
+ * degeneracy boundary (`scale === 0 || !(|D| > EPSILON*scale)`) writes NaN --
+ * NOT the cell path's centroid fallback. A cell needs a finite interior point;
+ * an alpha test must FAIL CLOSED. Because `NaN <= alphaSq` is always false, a
+ * triangle degenerate at the f64 NOISE FLOOR can NEVER be kept at ANY alpha.
+ * A merely THIN triangle is above that floor and keeps honest alpha-shape
+ * semantics: its circumradius is huge but finite, so it is kept only by a
+ * correspondingly huge alpha -- the guard traps arithmetic garbage, it does
+ * not reclassify thin-but-real geometry.
+ *
+ * @param {object} slot the pooled slot (slot.triCount already set, non-zero)
+ * @returns {void}
+ */
+function _buildClusterRadii(slot) {
+    const triangles = slot.tri.triangles;
+    const S = slot.scratch;
+    const crSq = slot.crSq;
+    const triCount = slot.triCount;
+    for (let t = 0; t < triCount; t++) {
+        const ia = triangles[3 * t], ib = triangles[3 * t + 1], ic = triangles[3 * t + 2];
+        const ax = S[2 * ia], ay = S[2 * ia + 1];
+        const bx = S[2 * ib], by = S[2 * ib + 1];
+        const cx = S[2 * ic], cy = S[2 * ic + 1];
+        const dx = bx - ax, dy = by - ay, ex = cx - ax, ey = cy - ay;
+        const bl = dx * dx + dy * dy, cl = ex * ex + ey * ey;
+        const D = dx * ey - dy * ex;
+        const scale = bl + cl;
+        // Fail closed to NaN on the overflow boundary (also traps a NaN D), so
+        // the triangle drops out of every alpha keep-set.
+        if (scale === 0 || !(Math.abs(D) > EPSILON * scale)) {
+            crSq[t] = NaN;
+        } else {
+            const d = 0.5 / D;
+            const ux = (ey * bl - dy * cl) * d;
+            const uy = (dx * cl - ex * bl) * d;
+            crSq[t] = ux * ux + uy * uy;
+        }
+    }
+}
+
+/**
+ * Allocate one pooled cluster-index slot: the field slot MINUS the z-gather
+ * buffer, PLUS the three cluster arrays. The `cursor` / `orientSign` / `stepCap`
+ * fields are declared (inert for cluster queries) so {@link _buildFieldSlot} can
+ * be called VERBATIM to compact + triangulate + derive the winding sign. Only
+ * ever called at a new concurrent high-water mark. The slot carries no methods.
+ *
+ * @param {number} maxPoints capacity
+ * @param {object} pool the factory's pool bookkeeping
+ * @param {number} poolIndex this slot's index in pool.slots
+ * @returns {object} the pooled slot
+ */
+function _createClusterSlot(maxPoints, pool, poolIndex) {
+    return {
+        _pool: pool,
+        poolIndex,
+        // Generation stamp: bumped on every build and every dispose.
+        gen: 0,
+        maxPoints,
+        // Per-build state (set by _buildFieldSlot).
+        n: 0, m: 0, triCount: 0, degenerate: true,
+        // Declared so _buildFieldSlot runs verbatim; cursor/stepCap are inert for
+        // cluster queries, orientSign carries the measured winding sign.
+        cursor: 0, orientSign: 1, stepCap: 0,
+        // The mesh engine and its f64 interleave scratch [x0,y0,x1,y1,...].
+        tri: new DelaunayTriangulator(maxPoints),
+        scratch: new Float64Array(2 * maxPoints),
+        // orig2v[i] = compacted vertex for original index i (-1 = non-finite);
+        // vert2orig[v] = original index for compacted vertex v.
+        orig2v: new Int32Array(maxPoints),
+        vert2orig: new Int32Array(maxPoints),
+        // Cluster arrays (max triangles = 2N - 5, max halfedges = 3*(2N-5)):
+        // per-triangle circumradius^2, per-triangle keep flag, per-halfedge marks.
+        crSq: new Float64Array(2 * maxPoints),
+        kept: new Uint8Array(2 * maxPoints),
+        visited: new Uint8Array(6 * maxPoints),
+    };
+}
+
+/**
+ * (Re)build a cluster slot: run {@link _buildFieldSlot} VERBATIM (compact finite
+ * points, triangulate, derive the winding sign), then precompute circumradii for
+ * a non-degenerate build. Zero allocation.
+ *
+ * @param {object} slot the pooled slot
+ * @param {ArrayLike<number>} pxs x coordinates
+ * @param {ArrayLike<number>} pys y coordinates
+ * @param {number} n logical point count
+ * @returns {void}
+ */
+function _buildClusterSlot(slot, pxs, pys, n) {
+    _buildFieldSlot(slot, pxs, pys, n);
+    if (!slot.degenerate) _buildClusterRadii(slot);
+}
+
+/**
+ * Emit the ordered convex hull as ORIGINAL site indices into `outIndices`,
+ * returning the vertex count `h` (<= n). A degenerate build (n < 3, collinear,
+ * all-duplicate) returns 0 -- NOT a throw. Two-phase and O(h): phase 1 walks the
+ * triangulator's own hull ring counting `h` (capped at slot.m against a
+ * degenerate self-loop), validates `outIndices.length >= h`, then phase 2
+ * re-walks emitting. Emission sense matches the alpha-shape outer-loop
+ * convention (screen-CCW / math-CW); the ring is already that sense, and the
+ * `orientSign` guard reverses the walk for a theoretically mirror-wound mesh.
+ * Zero allocation.
+ *
+ * @this {object} per-build cluster-index facade ({ _slot, _gen })
+ * @param {Int32Array} outIndices caller-owned, length >= h (n is the safe bound)
+ * @returns {number} hull vertex count h
+ * @throws {Error} if disposed/stale, `outIndices` not an Int32Array, too short,
+ *   or the ring walk overruns its cap
+ */
+function _clusterConvexHull(outIndices) {
+    const s = this._slot;
+    if (s === null || this._gen !== s.gen) _clusterThrow('disposed', 'convexHull');
+    if (outIndices == null || !(outIndices instanceof Int32Array)) _clusterThrow('outtype', 'outIndices');
+    if (s.degenerate) return 0;
+    const tri = s.tri;
+    // Screen-CCW / math-CW ring: hullNext for the measured mesh (orientSign < 0),
+    // hullPrev to reverse for a theoretically mirror-wound mesh.
+    const ring = s.orientSign < 0 ? tri.hullNext : tri.hullPrev;
+    const start = tri.hullStart;
+    const m = s.m;
+    // Phase 1: count (cap against a degenerate ring self-loop).
+    let h = 0;
+    let e = start;
+    do {
+        h++;
+        if (h > m) _clusterThrow('ring');
+        e = ring[e];
+    } while (e !== start);
+    if (outIndices.length < h) _clusterThrow('outshort', 'outIndices', h);
+    // Phase 2: emit ORIGINAL indices.
+    const v2o = s.vert2orig;
+    let w = 0;
+    e = start;
+    do {
+        outIndices[w++] = v2o[e];
+        e = ring[e];
+    } while (e !== start);
+    return h;
+}
+
+/**
+ * Extract the alpha-shape boundary into `outIndices` / `outLoopEnds`, returning
+ * the loop count. Keep every triangle whose circumradius is <= `alpha`; the
+ * boundary is the set of half-edges owned by exactly one kept triangle. Loops are
+ * CONCATENATED into `outIndices` as ORIGINAL indices (implicit closure last ->
+ * first); `outLoopEnds[i]` is the EXCLUSIVE end offset of loop i. 0 loops is
+ * legal (alpha keeps nothing, or a degenerate build).
+ *
+ * `alpha` is a finite RADIUS > 0 in input units. Infinity is NOT a hull alias --
+ * it throws; a large FINITE alpha lawfully degenerates to the convex hull (every
+ * triangle kept -> the outer boundary is the hull). NaN / +/-0 / negative /
+ * -Infinity / non-numbers all throw before any arithmetic touches the value.
+ *
+ * Two-phase, zero allocation. Pass 0 fills the keep flags. PHASE 1 counts loops
+ * and edges (writing NOTHING to the caller's buffers) with a hard step cap.
+ * VALIDATE-BEFORE-WRITE: `outIndices` / `outLoopEnds` length is checked against
+ * the counted totals BEFORE phase 2 writes a single byte. PHASE 2 re-scans in the
+ * identical order and emits. The emit rule (which vertex per edge, which rotation)
+ * is chosen ONCE from `slot.orientSign`, so outer loops come out screen-CCW /
+ * math-CW and holes opposite regardless of mesh winding, with no per-edge branch.
+ *
+ * @this {object} per-build cluster-index facade ({ _slot, _gen })
+ * @param {number} alpha finite radius > 0
+ * @param {Int32Array} outIndices caller-owned, length >= total boundary edges
+ *   (safe bound 3n)
+ * @param {Int32Array} outLoopEnds caller-owned, length >= loop count (safe bound n)
+ * @returns {number} loop count
+ * @throws {Error} if disposed/stale; `alpha` not a finite number > 0; either out
+ *   buffer not an Int32Array or too short for the counted totals; or the boundary
+ *   walk overruns its step cap
+ */
+function _clusterAlphaShape(alpha, outIndices, outLoopEnds) {
+    const s = this._slot;
+    if (s === null || this._gen !== s.gen) _clusterThrow('disposed', 'alphaShape');
+    // Alpha door: refuses null/undefined/NaN/+0/-0/negative/-Infinity/Infinity/
+    // strings without ever applying + or * to a non-number.
+    if (typeof alpha !== "number" || alpha !== alpha || alpha <= 0 || alpha === Infinity) {
+        _clusterThrow('alpha', alpha);
+    }
+    if (outIndices == null || !(outIndices instanceof Int32Array)) _clusterThrow('outtype', 'outIndices');
+    if (outLoopEnds == null || !(outLoopEnds instanceof Int32Array)) _clusterThrow('outtype', 'outLoopEnds');
+    const triCount = s.triCount;
+    if (s.degenerate || triCount === 0) return 0;
+
+    const alphaSq = alpha * alpha;
+    const triangles = s.tri.triangles;
+    const halfedges = s.tri.halfedges;
+    const crSq = s.crSq;
+    const kept = s.kept;
+    const visited = s.visited;
+    const trianglesLen = 3 * triCount;
+
+    // Pass 0: keep flags. NaN crSq (degenerate triangle) fails `<=` -> never kept.
+    for (let t = 0; t < triCount; t++) kept[t] = crSq[t] <= alphaSq ? 1 : 0;
+    visited.fill(0, 0, trianglesLen);
+
+    // PHASE 1: count loops + edges. No writes to caller buffers. The next-rotation
+    // successor traces the same loop PARTITION for either mesh winding (a mirror
+    // mesh only reverses each loop), so the counts are orientation-independent.
+    let totalEdges = 0, loopCount = 0, steps = 0;
+    for (let e = 0; e < trianglesLen; e++) {
+        if (!kept[(e / 3) | 0] || visited[e]) continue;
+        const he = halfedges[e];
+        if (!(he === -1 || !kept[(he / 3) | 0])) continue; // not a boundary edge
+        let f = e;
+        do {
+            visited[f] = 1;
+            totalEdges++;
+            if (++steps > trianglesLen) _clusterThrow('walk');
+            // Successor: rotate around the head vertex through kept triangles.
+            let g = (f % 3 === 2) ? f - 2 : f + 1;
+            let tw = halfedges[g];
+            while (tw !== -1 && kept[(tw / 3) | 0]) {
+                g = (tw % 3 === 2) ? tw - 2 : tw + 1;
+                tw = halfedges[g];
+            }
+            f = g;
+        } while (f !== e);
+        loopCount++;
+    }
+
+    // Absolute validate-before-write door: the documented 3n / n bounds guarantee
+    // a contract-compliant caller never trips this.
+    if (outIndices.length < totalEdges) _clusterThrow('outshort', 'outIndices', totalEdges);
+    if (outLoopEnds.length < loopCount) _clusterThrow('outshort', 'outLoopEnds', loopCount);
+
+    // PHASE 2: identical ascending scan, now emitting. Rule picked ONCE by winding.
+    visited.fill(0, 0, trianglesLen);
+    const v2o = s.vert2orig;
+    let w = 0, k = 0;
+    if (s.orientSign < 0) {
+        // Measured mesh (math-CW): emit the edge TAIL, next-rotation successor.
+        for (let e = 0; e < trianglesLen; e++) {
+            if (!kept[(e / 3) | 0] || visited[e]) continue;
+            const he = halfedges[e];
+            if (!(he === -1 || !kept[(he / 3) | 0])) continue;
+            let f = e;
+            do {
+                visited[f] = 1;
+                outIndices[w++] = v2o[triangles[f]];
+                let g = (f % 3 === 2) ? f - 2 : f + 1;
+                let tw = halfedges[g];
+                while (tw !== -1 && kept[(tw / 3) | 0]) {
+                    g = (tw % 3 === 2) ? tw - 2 : tw + 1;
+                    tw = halfedges[g];
+                }
+                f = g;
+            } while (f !== e);
+            outLoopEnds[k++] = w;
+        }
+    } else {
+        // Mirror-wound mesh (theoretical): emit the edge HEAD, prev-rotation
+        // successor, so the documented screen-CCW outer convention still holds.
+        for (let e = 0; e < trianglesLen; e++) {
+            if (!kept[(e / 3) | 0] || visited[e]) continue;
+            const he = halfedges[e];
+            if (!(he === -1 || !kept[(he / 3) | 0])) continue;
+            let f = e;
+            do {
+                visited[f] = 1;
+                const nf = (f % 3 === 2) ? f - 2 : f + 1;
+                outIndices[w++] = v2o[triangles[nf]];
+                let g = (f % 3 === 0) ? f + 2 : f - 1;
+                let tw = halfedges[g];
+                while (tw !== -1 && kept[(tw / 3) | 0]) {
+                    g = (tw % 3 === 0) ? tw + 2 : tw - 1;
+                    tw = halfedges[g];
+                }
+                f = g;
+            } while (f !== e);
+            outLoopEnds[k++] = w;
+        }
+    }
+    return loopCount;
+}
+
+/**
+ * Release a per-build cluster-index facade and return its pooled slot to the
+ * factory. Byte-identical semantics to `_fieldDispose`: bump the slot generation
+ * (invalidating every outstanding facade of this build), detach this facade so a
+ * second dispose fails closed, and push the slot back on the free stack.
+ *
+ * @this {object} per-build cluster-index facade ({ _slot, _gen })
+ * @throws {Error} if already disposed / stale
+ */
+function _clusterDispose() {
+    const s = this._slot;
+    if (s === null || this._gen !== s.gen) _clusterThrow('ddispose');
+    this._slot = null;
+    s.gen++;
+    const pool = s._pool;
+    pool.freeStack[pool.freeCount++] = s.poolIndex;
+}
+
+/**
+ * Frozen shared prototype for the per-build cluster-index facade. Every method
+ * lives here ONCE, so a build never allocates fresh closures.
+ */
+const CLUSTER_FACADE_PROTO = Object.freeze({
+    convexHull: _clusterConvexHull,
+    alphaShape: _clusterAlphaShape,
+    dispose: _clusterDispose,
+});
+
+/**
+ * Create a pooled cluster-index FACTORY sized for up to `maxPoints` points.
+ *
+ * The returned function is `(pxs, pys, n) -> clusterIndex`. It mirrors
+ * {@link createFieldIndex} exactly -- pooled factory-factory, SoA input, NaN/
+ * Infinity compaction, ORIGINAL indices, generation-stamped facades -- but its
+ * surface is boundary extraction: `convexHull` and `alphaShape`. Built fresh per
+ * refresh per point group by lite-charts' `outlines` layer.
+ *
+ * THE FOUR CONTRACT ANSWERS (quotable, for the consumer brief cluster-outlines.md):
+ *
+ * (a) SIZING BOUNDS. `alphaShape` needs `outIndices.length >= total boundary
+ *     edges`. A planar triangulation has at most `3n - 6` edges, and a pinch-
+ *     point vertex is counted PER EDGE (already covered by the edge bound), so
+ *     the tight bound is `3n - 6`; the safe recommendation is `3n`. `outLoopEnds`
+ *     needs `>= loopCount`; every loop has `>= 3` edges so the tight bound is
+ *     `n - 2`, safe `n`. `convexHull` needs `outIndices.length >= h`, bounded by
+ *     `n`. Because the method validates the counted totals BEFORE writing, an
+ *     exactly-3n / n caller can never trip the short-buffer door.
+ *
+ * (b) HOLE LOOPS ARE EMITTED. A kept annulus yields its inner rim as its own
+ *     loop. Orientation (the ABSOLUTE convention): outer loops are emitted CCW in
+ *     screen coordinates (+y down) = CW in math coordinates (+y up); hole loops
+ *     wind OPPOSITE; outer and hole always wind oppositely; `convexHull` is the
+ *     SAME sense as an outer loop. Stated in BOTH senses so it survives a screen-
+ *     space consumer.
+ *
+ * (c) COINCIDENT DUPLICATES. When several coincident points share a hull/boundary
+ *     vertex, the emitted ORIGINAL index is the sweep-order-FIRST duplicate (the
+ *     triangulator sorts by distance from the seed circumcenter and skips
+ *     near-duplicates within its EPSILON tolerance). This is DETERMINISTIC for
+ *     identical input arrays; it is NOT guaranteed to be the lowest index and MAY
+ *     change if the input order changes.
+ *
+ * (d) PERF. See bench/bench.js: warm-handle convexHull / alphaShape throughput at
+ *     n = 1k/10k/100k, and the small-n full-cycle (factory -> convexHull ->
+ *     alphaShape -> dispose) table charts' per-refresh unit is measured against.
+ *
+ * FAIL-CLOSED: a triangle degenerate at the f64 noise floor (the relative-area
+ * guard `|D| <= EPSILON*scale`, shared with the cell index) carries NaN `crSq`
+ * and can never be kept at any alpha -- while a merely thin triangle keeps its
+ * honest huge-but-finite circumradius and is kept only by a correspondingly
+ * huge alpha; a degenerate build returns 0 from both methods; the alpha door
+ * refuses every non-finite / non-positive value before arithmetic; the boundary
+ * and ring walks are step-capped; and both buffers are validated before any write.
+ *
+ * Memory model: a build allocates exactly one small facade (~48 B, young-gen);
+ * the mesh arena, scratch, index maps and cluster arrays are all pooled -- 0 B
+ * beyond the facade -- and every query is 0 B. Per-slot memory is ~116*maxPoints
+ * bytes + 16 KB (the field slot minus the z-gather buffer, plus crSq/kept/
+ * visited). A new slot is allocated only at a new concurrent high-water mark.
+ *
+ * @example
+ * // lite-charts v1.18.0 consumer (brief cluster-outlines.md; charts consumes
+ * // this AFTER lite-delaunay 1.4.0 publishes to npm):
+ * const chart = createScatterChart({
+ *   data,
+ *   outlines: { index: createClusterIndex(20_000), groupKey: 'zone', alpha: 25 },
+ * });
+ * // Per refresh, charts packs each group's pxs/pys and calls the factory once
+ * // per group, then convexHull (alpha absent) or alphaShape (alpha set), 0 B/frame.
+ *
+ * @param {number} maxPoints hard upper bound on `n` per build. Must be a
+ *   non-negative integer.
+ * @returns {(pxs: ArrayLike<number>, pys: ArrayLike<number>, n: number) => object}
+ *   the cluster-index factory.
+ * @throws {Error} if `maxPoints` is not a non-negative integer.
+ */
+export const createClusterIndex = (maxPoints) => {
+    if (!Number.isInteger(maxPoints) || maxPoints < 0) {
+        _clusterThrow('maxp', maxPoints);
+    }
+
+    // Pool bookkeeping, identical in shape to createFieldIndex.
+    const pool = { slots: [], freeStack: [], freeCount: 0 };
+
+    return function buildClusterIndex(pxs, pys, n) {
+        // Fail closed at build time -- all guards live here, off the query path.
+        if (!Number.isInteger(n) || n < 0) _clusterThrow('n', n);
+        if (n > maxPoints) _clusterThrow('nmax', n, maxPoints);
+        if (pxs == null || pys == null) _clusterThrow('arr');
+        if (pxs.length < n || pys.length < n) _clusterThrow('arrlen', n);
+
+        // Acquire a free slot, or grow the pool at a new high-water mark.
+        let idx;
+        if (pool.freeCount > 0) {
+            idx = pool.freeStack[--pool.freeCount];
+        } else {
+            idx = pool.slots.length;
+            pool.slots[idx] = _createClusterSlot(maxPoints, pool, idx);
+        }
+        const slot = pool.slots[idx];
+
+        _buildClusterSlot(slot, pxs, pys, n);
+        // New generation for this build; any facade from a prior build of this
+        // slot is now stale and will throw.
+        slot.gen++;
+        const facade = Object.create(CLUSTER_FACADE_PROTO);
         facade._slot = slot;
         facade._gen = slot.gen;
         return facade;

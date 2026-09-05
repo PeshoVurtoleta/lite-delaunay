@@ -42,6 +42,7 @@ Same sweepline algorithm as [Mapbox Delaunator](https://github.com/mapbox/delaun
 - [Spatial index: hit-testing dense point clouds](#spatial-index-hit-testing-dense-point-clouds)
 - [Cell index: bbox-clipped Voronoi cells](#cell-index-bbox-clipped-voronoi-cells)
 - [Field index: scattered data to regular grids](#field-index-scattered-data-to-regular-grids)
+- [Cluster index: hulls and alpha-shape outlines](#cluster-index-hulls-and-alpha-shape-outlines)
 - [API reference](#api-reference)
 - [Benchmarks](#benchmarks)
 - [Testing](#testing)
@@ -232,7 +233,7 @@ flowchart LR
     end
 ```
 
-Triangle `k`'s vertices are `triangles[3*k]`, `triangles[3*k + 1]`, `triangles[3*k + 2]`. Each is an index into your original `coords` array -- so the (x, y) of vertex `a` is `(coords[a*2], coords[a*2+1])`. Winding is **counter-clockwise in math coordinates** (in screen-space with Y pointing down, this looks clockwise).
+Triangle `k`'s vertices are `triangles[3*k]`, `triangles[3*k + 1]`, `triangles[3*k + 2]`. Each is an index into your original `coords` array -- so the (x, y) of vertex `a` is `(coords[a*2], coords[a*2+1])`. Winding is **clockwise in math coordinates** (in screen-space with Y pointing down, this reads counter-clockwise).
 
 ### `halfedges` -- neighbour links, the same shape
 
@@ -483,6 +484,62 @@ Per-slot memory is `~100*maxPoints` bytes + 16 KB -- the mesh arena, an f64 scra
 
 ---
 
+## Cluster index: hulls and alpha-shape outlines
+
+`createClusterIndex(maxPoints)` (v1.4.0) draws the boundary around a point
+group: the convex hull, or a concave **alpha shape** that actually hugs the
+cluster. The alpha shape is derived from the Delaunay triangulation itself --
+keep every triangle whose circumradius is `<= alpha`, and the outline is the
+set of edges owned by exactly one kept triangle -- which is why it lives here
+and not in caller code (a convex hull alone is ~30 lines of monotone chain;
+the alpha shape needs the mesh).
+
+```js
+import { createClusterIndex } from "@zakkster/lite-delaunay";
+
+const factory = createClusterIndex(512);           // sized for the largest group
+const handle = factory(groupXs, groupYs, groupN);  // fresh per group, per refresh
+
+const outIndices = new Int32Array(3 * groupN);     // safe bound: 3n
+const outLoopEnds = new Int32Array(groupN);        // safe bound: n
+
+const h = handle.convexHull(outIndices);           // ordered hull, h <= n
+const loops = handle.alphaShape(25, outIndices, outLoopEnds);
+// loop i is outIndices[start..outLoopEnds[i]-1], start = outLoopEnds[i-1] or 0;
+// closure is implicit (last -> first). ORIGINAL site indices throughout.
+
+handle.dispose();                                  // slot back to the pool
+```
+
+What you can rely on:
+
+- **Multiple disjoint loops** are the point: two sub-clusters bridged by a long
+  edge split into two loops at the right alpha. Interior **hole loops** are
+  emitted too. Orientation: outer loops (and `convexHull`) are counter-clockwise
+  in screen coordinates (+y down) = clockwise in math (+y up); holes wind
+  opposite -- outer and hole always differ, so any fill rule works.
+- **Sizing bounds** (pre-allocate once): `outIndices` tight `3n - 6`, safe `3n`;
+  `outLoopEnds` tight `n - 2`, safe `n`; hull bound `n`. Both methods count
+  first and validate before writing anything -- a `3n`/`n` caller can never hit
+  the short-buffer throw, and a throwing call never leaves a partial write.
+- **Fail closed**: triangles degenerate at the f64 noise floor carry `NaN`
+  circumradius and are never kept (a merely thin triangle keeps its honest
+  huge-but-finite circumradius and is kept only by a matching huge alpha);
+  degenerate builds return `0` from both methods; `alpha` must be
+  a finite number `> 0` (`Infinity` throws -- call `convexHull` for the hull; a
+  large *finite* alpha degenerates to it lawfully).
+- **Zero allocation**: pooled slots, one ~48 B facade per build, 0 B per query
+  -- the same contract as the other three indexes.
+
+Measured per-group cost of the full cycle `build -> convexHull -> alphaShape ->
+dispose` (the real per-refresh unit for an outlines layer):
+
+| n | 8 | 16 | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|---|
+| us/cycle | 0.72 | 1.67 | 3.62 | 7.76 | 16.6 | 34.8 |
+
+Even 64 groups per refresh cost well under a millisecond.
+
 ## API reference
 
 ### `new DelaunayTriangulator(maxPoints)`
@@ -591,7 +648,7 @@ A clean run prints **35 passed, 0 failed** and exits 0. The suite is organised i
 | 4. Constructor validation | Negative, non-integer, `NaN` `maxPoints` throw with a clear message. |
 | 5. Input type compatibility | `Float32Array`, `Float64Array`, plain `number[]` all produce identical output. |
 | 6. Known-tricky geometry | 8×8 cocircular grid (every cell is a Delaunay-degenerate quad), Archimedean spiral (sweepline stress pattern), points on a circle (fan triangulation), two distant clusters (long hull edges). |
-| 7. Topology invariants | Euler's formula (3F = 2E_interior + E_hull). Counter-clockwise winding in math coordinates. |
+| 7. Topology invariants | Euler's formula (3F = 2E_interior + E_hull). Clockwise winding in math coordinates (counter-clockwise on screen). |
 | 8. Zero-allocation | 10 000 `triangulate()` calls grow heap by < 1 MB (< 1 KB with forced GC). |
 
 If any test fails, exit code is 1 and the failing assertion is printed with the file/line. Suitable for CI.
@@ -620,9 +677,9 @@ Behaviours the test suite pins down:
 - **The hot path is allocation-free.** No `new`, no `[...]`, no object literals. Only typed-array indexed reads and writes.
 - **Degenerate inputs return 0; they do not throw or hang.** Coincident points, collinear points, and < 3 points all yield an empty triangulation with `trianglesLen = 0`. Detect them by checking the return value.
 - **State is reset on every call**, *including* degenerate ones. A degenerate call after a successful one will not leak stale triangles into the next reader.
-- **Output triangles use counter-clockwise winding in math coordinates** (Y-up, math convention). In screen-space (Y-down) this reads as clockwise. Same convention as Mapbox Delaunator.
+- **Output triangles use clockwise winding in math coordinates** (Y-up, math convention). In screen-space (Y-down) this reads as counter-clockwise. Same convention as Mapbox Delaunator (verified input-for-input).
 - **Half-edges form a closed mesh.** For every `e` with `halfedges[e] !== -1`, `halfedges[halfedges[e]] === e`. Hull edges have `halfedges[e] === -1`.
-- **The vertex set is preserved.** Triangle indices reference the same point indices you passed in -- no deduplication, no reordering, no fresh point IDs.
+- **The vertex set is preserved.** Triangle indices reference the same point indices you passed in -- no renumbering, no fresh point IDs. (EPSILON-coincident duplicates are skipped by the sweep and simply own no triangles; the surviving duplicate is the sweep-order-first one.)
 - **Numerical behaviour matches Mapbox Delaunator.** Same `f64` predicates, same EPSILON for near-duplicate skip, same seed-triangle selection. Outputs may differ from `robust-predicates`-based libraries on near-cocircular inputs.
 - **Hard cap on point count.** `triangulate(coords, n)` throws if `n > maxPoints`. There is no auto-grow -- that would defeat the zero-allocation contract.
 
